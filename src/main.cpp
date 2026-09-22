@@ -1,22 +1,12 @@
 ﻿#include <WiFi.h>
 #include <SPI.h>
+#include <Ethernet.h>
 #include <Wire.h>
 #include <WebServer.h>
 #include <DNSServer.h>
 #include <Preferences.h>
-#include <ModbusRTU.h>
-#include <Adafruit_MAX31865.h>
 #include <math.h>
-
-// --- SPI MAX31865 ---
-static const uint8_t MAX31865_CS_PIN = 5;
-static const uint8_t MAX31865_SCK_PIN = 18;
-static const uint8_t MAX31865_MISO_PIN = 19;
-static const uint8_t MAX31865_MOSI_PIN = 23;
-static const float MAX31865_RTD_NOMINAL = 100.0f;  // PT100
-static const float MAX31865_REF_RESISTOR = 430.0f; // Typical MAX31865 PT100 board
-static const max31865_numwires_t MAX31865_WIRES = MAX31865_2WIRE;
-Adafruit_MAX31865 rtd = Adafruit_MAX31865(MAX31865_CS_PIN);
+#include "ThermostatAnticipation.h"
 
 // --- Analog thermocouple amplifier AD8495 ---
 static const uint8_t ANALOG_A1 = 36;
@@ -29,8 +19,7 @@ static const uint8_t I2C_SDA_PIN = 4;
 static const uint8_t I2C_SCL_PIN = 15;
 static const uint8_t PCF8574_ADDRESS = 0x24;
 static const uint8_t PCF8574_INPUT_ADDRESS = 0x22;
-static const uint8_t HEATER_RELAY_PHASE_PIN = 0;   // Relay 1: heater phase.
-static const uint8_t HEATER_RELAY_NEUTRAL_PIN = 1; // Relay 2: heater neutral.
+static const uint8_t HEATER_CONTACTOR_RELAY_PIN = 3; // Physical relay 4, active-low.
 static const uint8_t RELAY_MOTOR_A_PIN = 4;        // Relay 5.
 static const uint8_t RELAY_MOTOR_B_PIN = 5;        // Relay 6.
 static const uint8_t DI6_BIT = 5;                  // P5 on input PCF8574.
@@ -49,30 +38,56 @@ WebServer server(80);
 DNSServer dnsServer;
 Preferences preferences;
 const uint16_t DNS_PORT = 53;
-HardwareSerial RS485Serial(2);
-ModbusRTU mb;
 
-static const uint8_t RS485_RX_PIN = 14;
-static const uint8_t RS485_TX_PIN = 27;
-static const uint32_t RS485_BAUDRATE = 9600;
-static const uint8_t MODBUS_SLAVE_ID = 1;
+// --- Ethernet / Modbus TCP (W5500) ---
+static const uint8_t W5500_CS_PIN = 5;
+static const uint16_t MODBUS_TCP_PORT = 502;
+static const uint8_t MODBUS_UNIT_ID = 1;
+byte ethernetMac[] = {0x02, 0xA0, 0xC9, 0x00, 0x00, 0x62};
+IPAddress ethernetIp(192, 168, 1, 51);
+IPAddress ethernetDns(192, 168, 1, 1);
+IPAddress ethernetGateway(192, 168, 1, 1);
+IPAddress ethernetSubnet(255, 255, 255, 0);
+bool ethernetUseDhcp = false;
+
+class Esp32EthernetServer : public EthernetServer {
+ public:
+  explicit Esp32EthernetServer(uint16_t port) : EthernetServer(port) {}
+
+  void begin(uint16_t port = 0) override {
+    (void)port;
+    EthernetServer::begin();
+  }
+};
+
+Esp32EthernetServer modbusServer(MODBUS_TCP_PORT);
+EthernetClient modbusClient;
+String networkSettingsMessage;
+bool networkSettingsSaved = false;
 
 enum ModbusReg : uint16_t {
-  REG_STATUS_BITS = 0,        // RO bitmask: 0 heating_enabled,1 heater_on,2 autotune_active,3 fault,4 thermo_open
+  REG_STATUS_BITS = 0,        // RO bits: 0 enabled, 1 contactor on, 3 fault, 4 sensor fault, 5 lid closed
   REG_TEMPERATURE_X10 = 1,    // RO int16
   REG_TARGET_X10 = 2,         // RW int16
-  REG_POWER_X10 = 3,          // RO uint16
-  REG_KP_X100 = 4,            // RW uint16
-  REG_KI_X10000 = 5,          // RW uint16
-  REG_KD_X100 = 6,            // RW uint16
+  REG_HYSTERESIS_X10 = 3,     // RW uint16
+  REG_MIN_ON_SECONDS = 4,     // RW uint16
+  REG_MIN_OFF_SECONDS = 5,    // RW uint16
+  REG_EMERGENCY_X10 = 6,      // RW uint16
   REG_COMMAND = 7,            // RW write command, firmware resets to 0 after processing
   REG_COMMAND_RESULT = 8,     // RO command result code
-  REG_AUTOTUNE_CYCLES = 9,    // RO
-  REG_FAULT_CODE = 10,        // RO 0 none, 1 RTD open/fault, 2 emergency
+  REG_RELAY_LOCK_SECONDS = 9, // RO seconds until contactor may switch
+  REG_FAULT_CODE = 10,        // RO 0 none, 1 sensor range, 2 emergency
   REG_HEATING_ENABLE = 11,    // RW 0/1
-  REG_AUTOTUNE_READY = 12,    // RO 0/1
+  REG_SENSOR_MV = 12,         // RO AD8495 output in mV
   REG_MOTOR_DIRECTION = 13,   // RO 0 stop, 1 open, 2 close
   REG_MOTOR_OPEN_REMAINING_SEC = 14, // RO
+  REG_ANTICIPATION_ENABLE = 15, // RW 0/1
+  REG_RATE_C_MIN_X100 = 16,    // RO int16
+  REG_ON_THRESHOLD_X10 = 17,  // RO int16
+  REG_OFF_THRESHOLD_X10 = 18, // RO int16
+  REG_OFF_LOOKAHEAD_X10 = 19, // RO seconds x10
+  REG_ON_LOOKAHEAD_X10 = 20,  // RO seconds x10
+  REG_LEARNED_CYCLES = 21,    // RO completed extrema
   REG_REG_COUNT = 32
 };
 
@@ -80,10 +95,8 @@ enum ModbusCommand : uint16_t {
   CMD_NONE = 0,
   CMD_HEAT_ON = 1,
   CMD_HEAT_OFF = 2,
-  CMD_AUTOTUNE_START = 3,
-  CMD_AUTOTUNE_STOP = 4,
   CMD_CLEAR_FAULT = 5,
-  CMD_SAVE_PID = 6,
+  CMD_SAVE_THERMOSTAT = 6,
   CMD_MOTOR_OPEN = 7,
   CMD_MOTOR_CLOSE = 8,
   CMD_MOTOR_STOP = 9
@@ -96,12 +109,15 @@ enum ModbusCommandResult : uint16_t {
   CMD_RES_INVALID_ARG = 3
 };
 
+uint16_t modbusRegs[REG_REG_COUNT] = {0};
+uint16_t commandResult = CMD_RES_OK;
+
 // --- Temperature / control state ---
 float lastTemperatureC = NAN;
-float ad8495TemperatureC = NAN;
+float lastRawTemperatureC = NAN;
 float ad8495VoltageMv = NAN;
-bool thermoOpenCircuit = false;
-bool heaterRelaysOn = false;
+bool sensorFault = true;
+bool heaterContactorOn = false;
 bool heatingEnabled = false;
 bool faultActive = false;
 String faultText = "";
@@ -117,58 +133,30 @@ enum MotorDirection : uint8_t {
 MotorDirection currentDirection = MOTOR_STOP;
 uint32_t motorRunStartMs = 0;
 uint32_t openRemainingMs = OPEN_TRAVEL_MS;
-uint8_t max31865LastFault = 0;
-uint16_t max31865LastRaw = 0;
-float max31865LastResistanceOhm = NAN;
-
-float targetTemperatureC = 180.0f;
-float heaterPowerPercent = 0.0f;
-
-// Conservative starting coefficients for a slow heater. Autotune can replace them.
-float pidKp = 12.0f;
-float pidKi = 0.08f;
-float pidKd = 8.0f;
-float pidIntegral = 0.0f;
-float pidPreviousError = 0.0f;
-bool pidHasPreviousError = false;
-uint32_t lastPidComputeMs = 0;
+float targetTemperatureC = ThermostatDefaults::targetC;
+float thermostatHysteresisC = ThermostatDefaults::hysteresisC;
+uint16_t thermostatMinOnSeconds = ThermostatDefaults::minOnSeconds;
+uint16_t thermostatMinOffSeconds = ThermostatDefaults::minOffSeconds;
+bool anticipationEnabled = true;
+ThermostatAnticipation anticipation;
+float emergencyTemperatureC = 300.0f;
+uint32_t contactorLastChangeMs = 0;
 
 static const uint32_t SENSOR_READ_INTERVAL_MS = 500;
-static const uint32_t PID_INTERVAL_MS = 500;
-static const float MIN_TARGET_C = 0.0f;
+static const float MIN_TARGET_C = 10.0f;
 static const float MAX_TARGET_C = 300.0f;
-static const float EMERGENCY_STOP_C = 330.0f;
-static const uint8_t SSR_PWM_PIN = 33;
-static const uint8_t SSR_PWM_CHANNEL = 0;
-static const uint16_t SSR_PWM_FREQ_HZ = 1000;
-static const uint8_t SSR_PWM_RESOLUTION_BITS = 10;
-static const uint16_t SSR_PWM_MAX_DUTY = (1U << SSR_PWM_RESOLUTION_BITS) - 1;
-
-// --- Fast PID autotune by one heat-up curve ---
-bool autotuneActive = false;
-bool autotuneReady = false;
-bool autotuneHeating = false;
-uint16_t autotuneCycles = 0;
-uint32_t autotuneLastSampleMs = 0;
-uint32_t autotuneRiseDelayMs = 0;
-float autotuneStartTemperatureC = NAN;
-float autotunePreviousTemperatureC = NAN;
-float autotuneMaxSlopeCPerSec = 0.0f;
-String autotuneStatus = "Остановлен";
-
-static const float AUTOTUNE_MIN_DELTA_C = 10.0f;
-static const float AUTOTUNE_RISE_DETECT_C = 0.5f;
-static const uint32_t AUTOTUNE_TIMEOUT_MS = 25UL * 60UL * 1000UL;
-static const float AUTOTUNE_FINISH_RATIO = 0.95f;
-uint32_t autotuneStartMs = 0;
+static const float SENSOR_MIN_C = 10.0f;
+static const float SENSOR_MAX_C = 300.0f;
+static const float MIN_HYSTERESIS_C = 0.5f;
+static const float MAX_HYSTERESIS_C = 50.0f;
+static const uint16_t MAX_MIN_SWITCH_SECONDS = 3600;
 static const float TEMP_FILTER_ALPHA = 0.25f;
 
-void resetPid();
 void setTargetTemperature(float targetC);
+void saveThermostatSettings();
 float clampFloat(float value, float low, float high);
 void syncModbusRegistersFromState();
-void applyModbusWritableRegisters();
-void handleModbusCommand();
+void handleModbusTcp();
 
 uint16_t floatToU16(float value, float scale) {
   int32_t scaled = static_cast<int32_t>(lroundf(value * scale));
@@ -196,45 +184,105 @@ float i16RegToFloat(uint16_t regValue, float scale) {
   return static_cast<float>(static_cast<int16_t>(regValue)) / scale;
 }
 
-String decodeMax31865Fault(uint8_t fault) {
-  if (fault == 0) {
-    return "NONE";
-  }
-  String s = "";
-  if (fault & MAX31865_FAULT_HIGHTHRESH) {
-    s += "HIGH_THRESH;";
-  }
-  if (fault & MAX31865_FAULT_LOWTHRESH) {
-    s += "LOW_THRESH;";
-  }
-  if (fault & MAX31865_FAULT_REFINLOW) {
-    s += "REFIN_LOW;";
-  }
-  if (fault & MAX31865_FAULT_REFINHIGH) {
-    s += "REFIN_HIGH;";
-  }
-  if (fault & MAX31865_FAULT_RTDINLOW) {
-    s += "RTDIN_LOW;";
-  }
-  if (fault & MAX31865_FAULT_OVUV) {
-    s += "OVUV;";
-  }
-  return s;
+bool parseIPv4(const String& text, IPAddress& address) {
+  String value = text;
+  value.trim();
+  return address.fromString(value);
 }
 
-void loadPidSettings() {
-  preferences.begin("pid", true);
-  pidKp = preferences.getFloat("kp", pidKp);
-  pidKi = preferences.getFloat("ki", pidKi);
-  pidKd = preferences.getFloat("kd", pidKd);
+void loadNetworkSettings() {
+  Preferences networkPreferences;
+  if (!networkPreferences.begin("ethernet", true)) {
+    return;
+  }
+
+  IPAddress address;
+  if (parseIPv4(networkPreferences.getString("ip", ethernetIp.toString()), address)) ethernetIp = address;
+  if (parseIPv4(networkPreferences.getString("subnet", ethernetSubnet.toString()), address)) ethernetSubnet = address;
+  if (parseIPv4(networkPreferences.getString("gateway", ethernetGateway.toString()), address)) ethernetGateway = address;
+  if (parseIPv4(networkPreferences.getString("dns", ethernetDns.toString()), address)) ethernetDns = address;
+  ethernetUseDhcp = networkPreferences.getBool("dhcp", false);
+  networkPreferences.end();
+}
+
+bool saveNetworkSettings() {
+  Preferences networkPreferences;
+  if (!networkPreferences.begin("ethernet", false)) {
+    return false;
+  }
+  bool saved = networkPreferences.putString("ip", ethernetIp.toString()) > 0;
+  saved &= networkPreferences.putString("subnet", ethernetSubnet.toString()) > 0;
+  saved &= networkPreferences.putString("gateway", ethernetGateway.toString()) > 0;
+  saved &= networkPreferences.putString("dns", ethernetDns.toString()) > 0;
+  saved &= networkPreferences.putBool("dhcp", ethernetUseDhcp) > 0;
+  networkPreferences.end();
+  return saved;
+}
+
+void applyEthernetSettings() {
+  if (modbusClient) modbusClient.stop();
+  if (ethernetUseDhcp) {
+    Ethernet.begin(ethernetMac, 10000, 2000);
+  } else {
+    Ethernet.begin(ethernetMac, ethernetIp, ethernetDns, ethernetGateway, ethernetSubnet);
+  }
+  delay(200);
+  modbusServer.begin();
+}
+
+const char* ethernetConnectionText() {
+  if (Ethernet.hardwareStatus() == EthernetNoHardware) return "W5500 не обнаружен";
+  if (Ethernet.linkStatus() == LinkOFF) return "Сетевой кабель отключен";
+  if (Ethernet.linkStatus() == Unknown) return "Состояние линии неизвестно";
+  if (Ethernet.localIP() == IPAddress(0, 0, 0, 0)) {
+    return ethernetUseDhcp ? "Адрес DHCP не получен" : "IP не назначен";
+  }
+  return "Подключено";
+}
+
+String modbusClientText() {
+  if (!modbusClient || !modbusClient.connected()) return "Нет подключения";
+  return modbusClient.remoteIP().toString() + ":" + String(modbusClient.remotePort());
+}
+
+void loadThermostatSettings() {
+  if (!preferences.begin("thermostat", true)) {
+    saveThermostatSettings();
+    return;
+  }
+  bool migrateDefaults = preferences.getUChar("version", 1) < 2;
+  targetTemperatureC = preferences.getFloat("target", targetTemperatureC);
+  thermostatHysteresisC = preferences.getFloat("hyst", thermostatHysteresisC);
+  thermostatMinOnSeconds = preferences.getUShort("min_on", thermostatMinOnSeconds);
+  thermostatMinOffSeconds = preferences.getUShort("min_off", thermostatMinOffSeconds);
+  emergencyTemperatureC = preferences.getFloat("emergency", emergencyTemperatureC);
+  anticipationEnabled = preferences.getBool("anticipation", true);
   preferences.end();
+
+  // Migrate only the previous factory hysteresis; preserve custom settings.
+  if (migrateDefaults && fabsf(thermostatHysteresisC - 5.0f) < 0.01f) {
+    thermostatHysteresisC = ThermostatDefaults::hysteresisC;
+  }
+  if (!isfinite(targetTemperatureC)) targetTemperatureC = ThermostatDefaults::targetC;
+  if (!isfinite(thermostatHysteresisC)) thermostatHysteresisC = ThermostatDefaults::hysteresisC;
+  if (!isfinite(emergencyTemperatureC)) emergencyTemperatureC = SENSOR_MAX_C;
+  targetTemperatureC = clampFloat(targetTemperatureC, MIN_TARGET_C, MAX_TARGET_C);
+  thermostatHysteresisC = clampFloat(thermostatHysteresisC, MIN_HYSTERESIS_C, MAX_HYSTERESIS_C);
+  thermostatMinOnSeconds = min(thermostatMinOnSeconds, MAX_MIN_SWITCH_SECONDS);
+  thermostatMinOffSeconds = min(thermostatMinOffSeconds, MAX_MIN_SWITCH_SECONDS);
+  emergencyTemperatureC = clampFloat(emergencyTemperatureC, targetTemperatureC, SENSOR_MAX_C);
+  if (migrateDefaults) saveThermostatSettings();
 }
 
-void savePidSettings() {
-  preferences.begin("pid", false);
-  preferences.putFloat("kp", pidKp);
-  preferences.putFloat("ki", pidKi);
-  preferences.putFloat("kd", pidKd);
+void saveThermostatSettings() {
+  if (!preferences.begin("thermostat", false)) return;
+  preferences.putFloat("target", targetTemperatureC);
+  preferences.putFloat("hyst", thermostatHysteresisC);
+  preferences.putUShort("min_on", thermostatMinOnSeconds);
+  preferences.putUShort("min_off", thermostatMinOffSeconds);
+  preferences.putFloat("emergency", emergencyTemperatureC);
+  preferences.putBool("anticipation", anticipationEnabled);
+  preferences.putUChar("version", 2);
   preferences.end();
 }
 
@@ -254,67 +302,6 @@ void updateDI6State() {
   uint8_t inputByte = Wire.read();
   bool bitState = bitRead(inputByte, DI6_BIT);
   di6Active = DI6_ACTIVE_LOW ? !bitState : bitState;
-}
-
-float readMAX31865C(bool& openCircuit) {
-  // Clear stale latched faults before a fresh conversion.
-  rtd.clearFault();
-  float temp = rtd.temperature(MAX31865_RTD_NOMINAL, MAX31865_REF_RESISTOR);
-  max31865LastRaw = rtd.readRTD();
-  max31865LastResistanceOhm = (static_cast<float>(max31865LastRaw) / 32768.0f) * MAX31865_REF_RESISTOR;
-  uint8_t fault = rtd.readFault();
-  max31865LastFault = fault;
-  if (fault) {
-    // Treat any RTD wiring/fault state as sensor-open/fault for control safety.
-    openCircuit = true;
-    faultText = String("MAX31865 fault: ") + decodeMax31865Fault(fault);
-    rtd.clearFault();
-    return NAN;
-  }
-
-  openCircuit = false;
-  if (!isfinite(temp)) {
-    openCircuit = true;
-    faultText = "MAX31865 fault: NON_FINITE_TEMP";
-    return NAN;
-  }
-  return temp;
-}
-
-float readStableMAX31865C(bool& openCircuit) {
-  // Reduce EMI-related spikes by median of several reads.
-  float samples[5];
-  uint8_t validCount = 0;
-  bool gotOpenCircuit = false;
-
-  for (uint8_t i = 0; i < 5; i++) {
-    bool sampleOpen = false;
-    float t = readMAX31865C(sampleOpen);
-    if (sampleOpen) {
-      gotOpenCircuit = true;
-    } else if (!isnan(t)) {
-      samples[validCount++] = t;
-    }
-    delay(5);
-  }
-
-  if (validCount == 0) {
-    openCircuit = gotOpenCircuit;
-    return NAN;
-  }
-
-  for (uint8_t i = 0; i < validCount; i++) {
-    for (uint8_t j = i + 1; j < validCount; j++) {
-      if (samples[j] < samples[i]) {
-        float tmp = samples[i];
-        samples[i] = samples[j];
-        samples[j] = tmp;
-      }
-    }
-  }
-
-  openCircuit = false;
-  return samples[validCount / 2];
 }
 
 float readAD8495C() {
@@ -347,15 +334,18 @@ void setRelayPin(uint8_t pin, bool enabled) {
 void setAllRelaysOff() {
   relayOutputMask = 0xFF;
   applyRelayOutputMask();
-  heaterRelaysOn = false;
+  heaterContactorOn = false;
   currentDirection = MOTOR_STOP;
   motorRunStartMs = 0;
 }
 
-void setHeaterRelays(bool enabled) {
-  heaterRelaysOn = enabled;
-  setRelayPin(HEATER_RELAY_PHASE_PIN, enabled);
-  setRelayPin(HEATER_RELAY_NEUTRAL_PIN, enabled);
+void setHeaterContactor(bool enabled) {
+  if (heaterContactorOn == enabled) {
+    return;
+  }
+  heaterContactorOn = enabled;
+  contactorLastChangeMs = millis();
+  setRelayPin(HEATER_CONTACTOR_RELAY_PIN, enabled);
 }
 
 void setMotorRelaysRaw(bool relayA_no, bool relayB_no) {
@@ -470,16 +460,9 @@ const char* motorDirectionText() {
   return "Стоп";
 }
 
-void setSsrPwmPercent(float powerPercent) {
-  float clampedPercent = clampFloat(powerPercent, 0.0f, 100.0f);
-  uint16_t duty = static_cast<uint16_t>((clampedPercent * SSR_PWM_MAX_DUTY) / 100.0f);
-  ledcWrite(SSR_PWM_CHANNEL, duty);
-}
-
 void stopHeater(const String& reason) {
-  heaterPowerPercent = 0.0f;
-  setSsrPwmPercent(0.0f);
-  setHeaterRelays(false);
+  anticipation.resetSamples();
+  setHeaterContactor(false);
 
   if (reason.length() > 0) {
     faultActive = true;
@@ -488,27 +471,19 @@ void stopHeater(const String& reason) {
 }
 
 void setHeatingEnabled(bool enabled) {
+  if (heatingEnabled != enabled) anticipation.reset();
   heatingEnabled = enabled;
-  mb.Hreg(REG_HEATING_ENABLE, heatingEnabled ? 1 : 0);
+  modbusRegs[REG_HEATING_ENABLE] = heatingEnabled ? 1 : 0;
 
   if (!heatingEnabled) {
     stopHeater("");
   }
-
-  resetPid();
-}
-
-void resetPid() {
-  pidIntegral = 0.0f;
-  pidPreviousError = 0.0f;
-  pidHasPreviousError = false;
-  lastPidComputeMs = 0;
 }
 
 void setTargetTemperature(float targetC) {
+  if (fabsf(targetC - targetTemperatureC) > 0.01f) anticipation.reset();
   targetTemperatureC = clampFloat(targetC, MIN_TARGET_C, MAX_TARGET_C);
-  mb.Hreg(REG_TARGET_X10, floatToI16Reg(targetTemperatureC, 10.0f));
-  resetPid();
+  modbusRegs[REG_TARGET_X10] = floatToI16Reg(targetTemperatureC, 10.0f);
 }
 
 float clampFloat(float value, float low, float high) {
@@ -521,173 +496,53 @@ float clampFloat(float value, float low, float high) {
   return value;
 }
 
-void stopAutotune(const String& statusText, bool keepReady) {
-  autotuneActive = false;
-  autotuneReady = keepReady;
-  autotuneHeating = false;
-  autotuneStatus = statusText;
-  heatingEnabled = false;
-  stopHeater("");
-  resetPid();
+uint16_t contactorLockSeconds(uint32_t nowMs) {
+  uint32_t minimumMs = (heaterContactorOn ? thermostatMinOnSeconds : thermostatMinOffSeconds) * 1000UL;
+  uint32_t elapsedMs = nowMs - contactorLastChangeMs;
+  if (elapsedMs >= minimumMs) {
+    return 0;
+  }
+  return static_cast<uint16_t>((minimumMs - elapsedMs + 999UL) / 1000UL);
 }
 
-void startAutotune() {
-  if (faultActive || thermoOpenCircuit || isnan(lastTemperatureC)) {
-    autotuneStatus = "Нет валидной температуры";
+void updateThermostat(uint32_t nowMs) {
+  if (!heatingEnabled || faultActive || sensorFault ||
+      !isfinite(lastTemperatureC) || !isfinite(lastRawTemperatureC) ||
+      nowMs - lastSensorReadMs > 3000UL) {
+    anticipation.resetSamples();
+    setHeaterContactor(false);
     return;
   }
 
-  if (targetTemperatureC - lastTemperatureC < AUTOTUNE_MIN_DELTA_C) {
-    autotuneStatus = "Уставка должна быть минимум на 10°C выше текущей";
-    return;
-  }
-
-  autotuneActive = true;
-  heatingEnabled = false;
-  autotuneReady = false;
-  autotuneHeating = true;
-  autotuneCycles = 0;
-  autotuneLastSampleMs = millis();
-  autotuneRiseDelayMs = 0;
-  autotuneStartTemperatureC = lastTemperatureC;
-  autotunePreviousTemperatureC = lastTemperatureC;
-  autotuneMaxSlopeCPerSec = 0.0f;
-  autotuneStartMs = millis();
-  autotuneStatus = "Быстрый автотюнинг: нагрев до уставки";
-  heaterPowerPercent = 100.0f;
-  setHeaterRelays(true);
-}
-
-void finishAutotune() {
-  if (autotuneMaxSlopeCPerSec <= 0.001f || autotuneRiseDelayMs == 0) {
-    stopAutotune("Не удалось рассчитать коэффициенты", false);
-    return;
-  }
-
-  float temperatureDeltaC = targetTemperatureC - autotuneStartTemperatureC;
-  float timeToTargetSec = temperatureDeltaC / autotuneMaxSlopeCPerSec;
-  float slopeCPerMin = autotuneMaxSlopeCPerSec * 60.0f;
-  float deadTimeSec = max(1.0f, autotuneRiseDelayMs / 1000.0f);
-
-  pidKp = clampFloat(80.0f / (slopeCPerMin + 0.5f), 8.0f, 30.0f);
-  pidKi = clampFloat(pidKp / max(60.0f, timeToTargetSec * 2.5f), 0.01f, 0.15f);
-  pidKd = clampFloat(pidKp * (deadTimeSec / max(30.0f, timeToTargetSec)), 2.0f, 20.0f);
-  savePidSettings();
-
-  stopAutotune("Готово, коэффициенты применены", true);
-}
-
-void updateAutotune(uint32_t nowMs) {
-  if (!autotuneActive) {
-    return;
-  }
-
-  if (faultActive || thermoOpenCircuit || isnan(lastTemperatureC)) {
-    stopAutotune("Остановлен из-за ошибки датчика", false);
-    return;
-  }
-
-  if (lastTemperatureC >= EMERGENCY_STOP_C) {
-    stopAutotune("Аварийная температура", false);
-    faultActive = true;
-    faultText = "Аварийная температура";
-    return;
-  }
-
-  if (nowMs - autotuneStartMs > AUTOTUNE_TIMEOUT_MS) {
-    stopAutotune("Таймаут автотюнинга", false);
-    return;
-  }
-
-  if (nowMs == autotuneLastSampleMs) {
-    return;
-  }
-
-  float dtSec = (nowMs - autotuneLastSampleMs) / 1000.0f;
-  if (dtSec > 0.0f) {
-    float slopeCPerSec = (lastTemperatureC - autotunePreviousTemperatureC) / dtSec;
-    if (slopeCPerSec > autotuneMaxSlopeCPerSec) {
-      autotuneMaxSlopeCPerSec = slopeCPerSec;
-    }
-  }
-
-  if (autotuneRiseDelayMs == 0 && lastTemperatureC >= autotuneStartTemperatureC + AUTOTUNE_RISE_DETECT_C) {
-    autotuneRiseDelayMs = nowMs - autotuneStartMs;
-  }
-
-  autotunePreviousTemperatureC = lastTemperatureC;
-  autotuneLastSampleMs = nowMs;
-  autotuneCycles++;
-
-  float finishTemperature = autotuneStartTemperatureC + ((targetTemperatureC - autotuneStartTemperatureC) * AUTOTUNE_FINISH_RATIO);
-  if (lastTemperatureC >= finishTemperature) {
-    heaterPowerPercent = 0.0f;
-    finishAutotune();
-  }
-}
-
-void computePid(uint32_t nowMs) {
-  if (autotuneActive) {
-    return;
-  }
-
-  if (!heatingEnabled) {
-    heaterPowerPercent = 0.0f;
-    setHeaterRelays(false);
-    return;
-  }
-
-  if (faultActive || thermoOpenCircuit || isnan(lastTemperatureC)) {
-    stopHeater("");
-    return;
-  }
-
-  if (lastTemperatureC >= EMERGENCY_STOP_C) {
+  // The emergency limit must not wait for the display filter or relay lock.
+  if (lastRawTemperatureC >= emergencyTemperatureC || lastTemperatureC >= emergencyTemperatureC) {
     stopHeater("Аварийная температура");
     return;
   }
 
-  if (lastPidComputeMs != 0 && nowMs - lastPidComputeMs < PID_INTERVAL_MS) {
+  if (contactorLockSeconds(nowMs) != 0) {
     return;
   }
 
-  float dt = lastPidComputeMs == 0 ? (PID_INTERVAL_MS / 1000.0f) : ((nowMs - lastPidComputeMs) / 1000.0f);
-  lastPidComputeMs = nowMs;
-
-  float error = targetTemperatureC - lastTemperatureC;
-  pidIntegral += error * dt;
-  pidIntegral = clampFloat(pidIntegral, -1000.0f, 1000.0f);
-
-  float derivative = 0.0f;
-  if (pidHasPreviousError && dt > 0.0f) {
-    derivative = (error - pidPreviousError) / dt;
+  bool requestedOn = heaterContactorOn;
+  if (anticipationEnabled) {
+    requestedOn = anticipation.demand(heaterContactorOn, lastTemperatureC,
+                                      targetTemperatureC, thermostatHysteresisC);
+  } else if (heaterContactorOn && lastTemperatureC >= targetTemperatureC) {
+    requestedOn = false;
+  } else if (!heaterContactorOn && lastTemperatureC <= targetTemperatureC - thermostatHysteresisC) {
+    requestedOn = true;
   }
-  pidPreviousError = error;
-  pidHasPreviousError = true;
-
-  float output = (pidKp * error) + (pidKi * pidIntegral) + (pidKd * derivative);
-  heaterPowerPercent = clampFloat(output, 0.0f, 100.0f);
-}
-
-void applyHeaterOutput() {
-  if (faultActive || thermoOpenCircuit || isnan(lastTemperatureC)) {
-    setSsrPwmPercent(0.0f);
-    setHeaterRelays(false);
-    return;
+  if (requestedOn != heaterContactorOn) {
+    setHeaterContactor(requestedOn);
+    if (anticipationEnabled && currentDirection == MOTOR_STOP) {
+      anticipation.switched(requestedOn, lastTemperatureC, nowMs);
+    }
   }
-
-  if (autotuneActive || heatingEnabled) {
-    setHeaterRelays(true);
-    setSsrPwmPercent(heaterPowerPercent);
-    return;
-  }
-
-  setSsrPwmPercent(0.0f);
-  setHeaterRelays(false);
 }
 
 String formatTemperatureValue() {
-  if (thermoOpenCircuit) {
+  if (sensorFault) {
     return "Ошибка";
   }
 
@@ -700,66 +555,43 @@ String formatTemperatureValue() {
   return String(buff);
 }
 
-String formatAD8495TemperatureValue() {
-  if (isnan(ad8495TemperatureC)) {
-    return "Нет данных";
-  }
-
-  char buff[12];
-  snprintf(buff, sizeof(buff), "%.2f", ad8495TemperatureC);
-  return String(buff);
-}
-
 String boolToJson(bool value) {
   return value ? "true" : "false";
 }
 
-uint8_t rtdWireCount() {
-  if (MAX31865_WIRES == MAX31865_2WIRE) {
-    return 2;
-  }
-  if (MAX31865_WIRES == MAX31865_3WIRE) {
-    return 3;
-  }
-  return 4;
+float thermostatOnThreshold() {
+  return anticipationEnabled ? anticipation.onThreshold(targetTemperatureC, thermostatHysteresisC)
+                             : targetTemperatureC - thermostatHysteresisC;
+}
+
+float thermostatOffThreshold() {
+  return anticipationEnabled ? anticipation.offThreshold(targetTemperatureC) : targetTemperatureC;
 }
 
 String statusJson() {
   String json = "{";
   json += "\"temperature\":";
   json += isnan(lastTemperatureC) ? "null" : String(lastTemperatureC, 2);
-  json += ",\"ad8495_temperature\":";
-  json += isnan(ad8495TemperatureC) ? "null" : String(ad8495TemperatureC, 2);
   json += ",\"ad8495_mv\":";
   json += isnan(ad8495VoltageMv) ? "null" : String(ad8495VoltageMv, 1);
   json += ",\"target\":" + String(targetTemperatureC, 1);
-  json += ",\"power\":" + String(heaterPowerPercent, 1);
-  json += ",\"heater_on\":" + boolToJson(heaterRelaysOn);
+  json += ",\"hysteresis\":" + String(thermostatHysteresisC, 1);
+  json += ",\"anticipation_enabled\":" + boolToJson(anticipationEnabled);
+  json += ",\"temperature_rate\":" + String(anticipation.rateCPerSecond() * 60.0f, 2);
+  json += ",\"on_threshold\":" + String(thermostatOnThreshold(), 1);
+  json += ",\"off_threshold\":" + String(thermostatOffThreshold(), 1);
+  json += ",\"off_lookahead_seconds\":" + String(anticipation.offSeconds(), 1);
+  json += ",\"on_lookahead_seconds\":" + String(anticipation.onSeconds(), 1);
+  json += ",\"learned_cycles\":" + String(anticipation.learnedCycles());
+  json += ",\"min_on_seconds\":" + String(thermostatMinOnSeconds);
+  json += ",\"min_off_seconds\":" + String(thermostatMinOffSeconds);
+  json += ",\"emergency_temperature\":" + String(emergencyTemperatureC, 1);
+  json += ",\"relay_lock_seconds\":" + String(contactorLockSeconds(millis()));
+  json += ",\"heater_on\":" + boolToJson(heaterContactorOn);
   json += ",\"heating_enabled\":" + boolToJson(heatingEnabled);
-  json += ",\"fault\":" + boolToJson(faultActive || thermoOpenCircuit);
-  json += ",\"fault_text\":\"";
-  if (faultText.length() > 0) {
-    json += faultText;
-  } else if (thermoOpenCircuit) {
-    json += "RTD датчик не подключен/ошибка MAX31865";
-  }
-  json += "\",\"autotune_active\":" + boolToJson(autotuneActive);
-  json += ",\"autotune_ready\":" + boolToJson(autotuneReady);
-  json += ",\"autotune_cycles\":" + String(autotuneCycles);
-  json += ",\"autotune_status\":\"" + autotuneStatus + "\"";
-  json += ",\"kp\":" + String(pidKp, 4);
-  json += ",\"ki\":" + String(pidKi, 6);
-  json += ",\"kd\":" + String(pidKd, 4);
-  json += ",\"fault_hex\":\"0x";
-  if (max31865LastFault < 16) {
-    json += "0";
-  }
-  json += String(max31865LastFault, HEX);
-  json += "\"";
-  json += ",\"rtd_raw\":" + String(max31865LastRaw);
-  json += ",\"rtd_ohm\":";
-  json += isnan(max31865LastResistanceOhm) ? "null" : String(max31865LastResistanceOhm, 3);
-  json += ",\"rtd_wires\":" + String(rtdWireCount());
+  json += ",\"sensor_fault\":" + boolToJson(sensorFault);
+  json += ",\"fault\":" + boolToJson(faultActive || sensorFault);
+  json += ",\"fault_text\":\"" + faultText + "\"";
   json += ",\"di6_active\":" + boolToJson(di6Active);
   json += ",\"motor_direction\":" + String((uint8_t)currentDirection);
   json += ",\"motor_direction_text\":\"" + String(motorDirectionText()) + "\"";
@@ -773,16 +605,13 @@ void syncModbusRegistersFromState() {
   if (heatingEnabled) {
     statusBits |= (1U << 0);
   }
-  if (heaterRelaysOn) {
+  if (heaterContactorOn) {
     statusBits |= (1U << 1);
-  }
-  if (autotuneActive) {
-    statusBits |= (1U << 2);
   }
   if (faultActive) {
     statusBits |= (1U << 3);
   }
-  if (thermoOpenCircuit) {
+  if (sensorFault) {
     statusBits |= (1U << 4);
   }
   if (di6Active) {
@@ -790,106 +619,55 @@ void syncModbusRegistersFromState() {
   }
 
   uint16_t faultCode = 0;
-  if (thermoOpenCircuit) {
+  if (sensorFault) {
     faultCode = 1;
   } else if (faultActive) {
     faultCode = 2;
   }
 
-  mb.Hreg(REG_STATUS_BITS, statusBits);
-  mb.Hreg(REG_TEMPERATURE_X10, isnan(lastTemperatureC) ? static_cast<uint16_t>(0x8000) : floatToI16Reg(lastTemperatureC, 10.0f));
-  mb.Hreg(REG_TARGET_X10, floatToI16Reg(targetTemperatureC, 10.0f));
-  mb.Hreg(REG_POWER_X10, floatToU16(heaterPowerPercent, 10.0f));
-  mb.Hreg(REG_KP_X100, floatToU16(pidKp, 100.0f));
-  mb.Hreg(REG_KI_X10000, floatToU16(pidKi, 10000.0f));
-  mb.Hreg(REG_KD_X100, floatToU16(pidKd, 100.0f));
-  mb.Hreg(REG_AUTOTUNE_CYCLES, autotuneCycles);
-  mb.Hreg(REG_FAULT_CODE, faultCode);
-  mb.Hreg(REG_HEATING_ENABLE, heatingEnabled ? 1 : 0);
-  mb.Hreg(REG_AUTOTUNE_READY, autotuneReady ? 1 : 0);
-  mb.Hreg(REG_MOTOR_DIRECTION, (uint16_t)currentDirection);
-  mb.Hreg(REG_MOTOR_OPEN_REMAINING_SEC, openRemainingSeconds());
+  modbusRegs[REG_STATUS_BITS] = statusBits;
+  modbusRegs[REG_TEMPERATURE_X10] = isnan(lastTemperatureC) ? static_cast<uint16_t>(0x8000) : floatToI16Reg(lastTemperatureC, 10.0f);
+  modbusRegs[REG_TARGET_X10] = floatToI16Reg(targetTemperatureC, 10.0f);
+  modbusRegs[REG_HYSTERESIS_X10] = floatToU16(thermostatHysteresisC, 10.0f);
+  modbusRegs[REG_MIN_ON_SECONDS] = thermostatMinOnSeconds;
+  modbusRegs[REG_MIN_OFF_SECONDS] = thermostatMinOffSeconds;
+  modbusRegs[REG_EMERGENCY_X10] = floatToU16(emergencyTemperatureC, 10.0f);
+  modbusRegs[REG_COMMAND] = CMD_NONE;
+  modbusRegs[REG_COMMAND_RESULT] = commandResult;
+  modbusRegs[REG_RELAY_LOCK_SECONDS] = contactorLockSeconds(millis());
+  modbusRegs[REG_FAULT_CODE] = faultCode;
+  modbusRegs[REG_HEATING_ENABLE] = heatingEnabled ? 1 : 0;
+  modbusRegs[REG_SENSOR_MV] = isnan(ad8495VoltageMv) ? 0 : floatToU16(ad8495VoltageMv, 1.0f);
+  modbusRegs[REG_MOTOR_DIRECTION] = static_cast<uint16_t>(currentDirection);
+  modbusRegs[REG_MOTOR_OPEN_REMAINING_SEC] = openRemainingSeconds();
+  modbusRegs[REG_ANTICIPATION_ENABLE] = anticipationEnabled ? 1 : 0;
+  modbusRegs[REG_RATE_C_MIN_X100] = floatToI16Reg(anticipation.rateCPerSecond() * 60.0f, 100.0f);
+  modbusRegs[REG_ON_THRESHOLD_X10] = floatToI16Reg(thermostatOnThreshold(), 10.0f);
+  modbusRegs[REG_OFF_THRESHOLD_X10] = floatToI16Reg(thermostatOffThreshold(), 10.0f);
+  modbusRegs[REG_OFF_LOOKAHEAD_X10] = floatToU16(anticipation.offSeconds(), 10.0f);
+  modbusRegs[REG_ON_LOOKAHEAD_X10] = floatToU16(anticipation.onSeconds(), 10.0f);
+  modbusRegs[REG_LEARNED_CYCLES] = anticipation.learnedCycles();
 }
 
-void applyModbusWritableRegisters() {
-  uint16_t regTarget = mb.Hreg(REG_TARGET_X10);
-  uint16_t regKp = mb.Hreg(REG_KP_X100);
-  uint16_t regKi = mb.Hreg(REG_KI_X10000);
-  uint16_t regKd = mb.Hreg(REG_KD_X100);
-  uint16_t regHeatingEnable = mb.Hreg(REG_HEATING_ENABLE);
-  float requestedTarget = clampFloat(i16RegToFloat(regTarget, 10.0f), MIN_TARGET_C, MAX_TARGET_C);
-  if (fabsf(requestedTarget - targetTemperatureC) > 0.01f) {
-    if (!autotuneActive) {
-      setTargetTemperature(requestedTarget);
-      faultActive = false;
-      faultText = "";
-      mb.Hreg(REG_COMMAND_RESULT, CMD_RES_OK);
-    } else {
-      mb.Hreg(REG_COMMAND_RESULT, CMD_RES_BUSY);
-    }
-  }
-
-  float requestedKp = clampFloat(static_cast<float>(regKp) / 100.0f, 0.0f, 300.0f);
-  float requestedKi = clampFloat(static_cast<float>(regKi) / 10000.0f, 0.0f, 10.0f);
-  float requestedKd = clampFloat(static_cast<float>(regKd) / 100.0f, 0.0f, 300.0f);
-  if (fabsf(requestedKp - pidKp) > 0.001f || fabsf(requestedKi - pidKi) > 0.0001f || fabsf(requestedKd - pidKd) > 0.001f) {
-    pidKp = requestedKp;
-    pidKi = requestedKi;
-    pidKd = requestedKd;
-    resetPid();
-    savePidSettings();
-    mb.Hreg(REG_COMMAND_RESULT, CMD_RES_OK);
-  }
-
-  bool requestedHeatingEnable = regHeatingEnable != 0;
-  if (requestedHeatingEnable != heatingEnabled) {
-    if (!autotuneActive) {
-      setHeatingEnabled(requestedHeatingEnable);
-      mb.Hreg(REG_COMMAND_RESULT, CMD_RES_OK);
-    } else {
-      mb.Hreg(REG_COMMAND_RESULT, CMD_RES_BUSY);
-    }
-  }
-}
-
-void handleModbusCommand() {
-  uint16_t cmd = mb.Hreg(REG_COMMAND);
-  if (cmd == CMD_NONE) {
-    return;
-  }
-
-  uint16_t result = CMD_RES_OK;
+void executeModbusCommand(uint16_t cmd) {
+  commandResult = CMD_RES_OK;
   switch (cmd) {
+    case CMD_NONE:
+      break;
     case CMD_HEAT_ON:
-      if (autotuneActive) {
-        result = CMD_RES_BUSY;
-      } else {
-        faultActive = false;
-        faultText = "";
-        setHeatingEnabled(true);
-      }
+      faultActive = false;
+      faultText = sensorFault ? "Температура AD8495 вне диапазона 10...300 °C" : "";
+      setHeatingEnabled(true);
       break;
     case CMD_HEAT_OFF:
       setHeatingEnabled(false);
       break;
-    case CMD_AUTOTUNE_START:
-      faultActive = false;
-      faultText = "";
-      startAutotune();
-      if (!autotuneActive) {
-        result = CMD_RES_INVALID_ARG;
-      }
-      break;
-    case CMD_AUTOTUNE_STOP:
-      stopAutotune("Остановлен вручную", false);
-      break;
     case CMD_CLEAR_FAULT:
       faultActive = false;
-      faultText = "";
-      result = CMD_RES_OK;
+      faultText = sensorFault ? "Температура AD8495 вне диапазона 10...300 °C" : "";
       break;
-    case CMD_SAVE_PID:
-      savePidSettings();
+    case CMD_SAVE_THERMOSTAT:
+      saveThermostatSettings();
       break;
     case CMD_MOTOR_OPEN:
       startOpenMotor();
@@ -901,12 +679,150 @@ void handleModbusCommand() {
       stopMotor();
       break;
     default:
-      result = CMD_RES_UNKNOWN_CMD;
+      commandResult = CMD_RES_UNKNOWN_CMD;
       break;
   }
+  syncModbusRegistersFromState();
+}
 
-  mb.Hreg(REG_COMMAND_RESULT, result);
-  mb.Hreg(REG_COMMAND, CMD_NONE);
+bool writeModbusRegister(uint16_t address, uint16_t value) {
+  if (address >= REG_REG_COUNT) return false;
+  commandResult = CMD_RES_OK;
+
+  switch (address) {
+    case REG_COMMAND:
+      executeModbusCommand(value);
+      return true;
+    case REG_TARGET_X10:
+      setTargetTemperature(clampFloat(i16RegToFloat(value, 10.0f), MIN_TARGET_C, MAX_TARGET_C));
+      if (emergencyTemperatureC < targetTemperatureC) emergencyTemperatureC = targetTemperatureC;
+      saveThermostatSettings();
+      break;
+    case REG_HYSTERESIS_X10:
+      thermostatHysteresisC = clampFloat(value / 10.0f, MIN_HYSTERESIS_C, MAX_HYSTERESIS_C);
+      anticipation.cancelCycle();
+      saveThermostatSettings();
+      break;
+    case REG_MIN_ON_SECONDS:
+      thermostatMinOnSeconds = min(value, MAX_MIN_SWITCH_SECONDS);
+      anticipation.cancelCycle();
+      saveThermostatSettings();
+      break;
+    case REG_MIN_OFF_SECONDS:
+      thermostatMinOffSeconds = min(value, MAX_MIN_SWITCH_SECONDS);
+      anticipation.cancelCycle();
+      saveThermostatSettings();
+      break;
+    case REG_EMERGENCY_X10:
+      emergencyTemperatureC = clampFloat(value / 10.0f, targetTemperatureC, SENSOR_MAX_C);
+      saveThermostatSettings();
+      break;
+    case REG_HEATING_ENABLE:
+      setHeatingEnabled(value != 0);
+      break;
+    case REG_ANTICIPATION_ENABLE:
+      if (value > 1) {
+        commandResult = CMD_RES_INVALID_ARG;
+        break;
+      }
+      if (anticipationEnabled != (value != 0)) anticipation.reset();
+      anticipationEnabled = value != 0;
+      saveThermostatSettings();
+      break;
+    default:
+      return false;
+  }
+  syncModbusRegistersFromState();
+  return true;
+}
+
+void sendModbusTcpResponse(EthernetClient& client, const uint8_t* requestHeader, const uint8_t* pdu, uint16_t pduLen) {
+  uint8_t header[7] = {requestHeader[0], requestHeader[1], 0, 0, highByte(pduLen + 1), lowByte(pduLen + 1), requestHeader[6]};
+  client.write(header, sizeof(header));
+  client.write(pdu, pduLen);
+}
+
+void sendModbusException(EthernetClient& client, const uint8_t* header, uint8_t functionCode, uint8_t exceptionCode) {
+  uint8_t pdu[2] = {static_cast<uint8_t>(functionCode | 0x80), exceptionCode};
+  sendModbusTcpResponse(client, header, pdu, sizeof(pdu));
+}
+
+bool waitForClientBytes(EthernetClient& client, int count, uint16_t timeoutMs = 50) {
+  uint32_t started = millis();
+  while (client.connected() && client.available() < count && millis() - started < timeoutMs) delay(1);
+  return client.available() >= count;
+}
+
+void processModbusTcpRequest(EthernetClient& client) {
+  if (!waitForClientBytes(client, 7)) return;
+  uint8_t header[7];
+  client.read(header, sizeof(header));
+  uint16_t protocolId = word(header[2], header[3]);
+  uint16_t length = word(header[4], header[5]);
+  if (protocolId != 0 || length < 2 || length > 253) { client.stop(); return; }
+
+  uint16_t pduLen = length - 1;
+  if (!waitForClientBytes(client, pduLen)) { client.stop(); return; }
+  uint8_t pdu[253];
+  client.read(pdu, pduLen);
+  uint8_t functionCode = pdu[0];
+  if (header[6] != MODBUS_UNIT_ID && header[6] != 0) return;
+  syncModbusRegistersFromState();
+
+  if (functionCode == 0x03) {
+    if (pduLen < 5) { sendModbusException(client, header, functionCode, 0x03); return; }
+    uint16_t startAddress = word(pdu[1], pdu[2]);
+    uint16_t quantity = word(pdu[3], pdu[4]);
+    if (quantity == 0 || quantity > 60 || startAddress + quantity > REG_REG_COUNT) {
+      sendModbusException(client, header, functionCode, 0x02); return;
+    }
+    uint8_t response[125];
+    response[0] = functionCode;
+    response[1] = quantity * 2;
+    for (uint16_t i = 0; i < quantity; i++) {
+      uint16_t registerValue = modbusRegs[startAddress + i];
+      response[2 + i * 2] = highByte(registerValue);
+      response[3 + i * 2] = lowByte(registerValue);
+    }
+    sendModbusTcpResponse(client, header, response, 2 + quantity * 2);
+    return;
+  }
+
+  if (functionCode == 0x06) {
+    if (pduLen < 5) { sendModbusException(client, header, functionCode, 0x03); return; }
+    uint16_t address = word(pdu[1], pdu[2]);
+    uint16_t value = word(pdu[3], pdu[4]);
+    if (!writeModbusRegister(address, value)) { sendModbusException(client, header, functionCode, 0x02); return; }
+    sendModbusTcpResponse(client, header, pdu, 5);
+    return;
+  }
+
+  if (functionCode == 0x10) {
+    if (pduLen < 6) { sendModbusException(client, header, functionCode, 0x03); return; }
+    uint16_t startAddress = word(pdu[1], pdu[2]);
+    uint16_t quantity = word(pdu[3], pdu[4]);
+    uint8_t byteCount = pdu[5];
+    if (quantity == 0 || byteCount != quantity * 2 || startAddress + quantity > REG_REG_COUNT || pduLen < 6 + byteCount) {
+      sendModbusException(client, header, functionCode, 0x02); return;
+    }
+    for (uint16_t i = 0; i < quantity; i++) {
+      uint16_t value = word(pdu[6 + i * 2], pdu[7 + i * 2]);
+      if (!writeModbusRegister(startAddress + i, value)) { sendModbusException(client, header, functionCode, 0x02); return; }
+    }
+    uint8_t response[5] = {functionCode, pdu[1], pdu[2], pdu[3], pdu[4]};
+    sendModbusTcpResponse(client, header, response, sizeof(response));
+    return;
+  }
+
+  sendModbusException(client, header, functionCode, 0x01);
+}
+
+void handleModbusTcp() {
+  if (!modbusClient || !modbusClient.connected()) {
+    EthernetClient newClient = modbusServer.available();
+    if (newClient) modbusClient = newClient;
+  }
+  if (modbusClient && modbusClient.connected() && modbusClient.available()) processModbusTcpRequest(modbusClient);
 }
 
 String generateHTML() {
@@ -916,7 +832,7 @@ String generateHTML() {
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>ПИД нагреватель</title>
+  <title>Термостат гриля</title>
   <style>
     :root {
       --bg: #f1f5f2;
@@ -962,6 +878,16 @@ String generateHTML() {
     .value { font-size: 34px; line-height: 1; font-weight: 700; color: var(--accent); }
     .unit { font-size: 16px; color: var(--muted); }
     form, .actions { display: grid; grid-template-columns: 1fr auto; gap: 10px; margin-top: 14px; }
+    .settings-form {
+      grid-template-columns: 1fr 1fr;
+      padding: 14px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fbfdfb;
+    }
+    .field { display: grid; gap: 6px; }
+    .field label { color: var(--muted); font-size: 13px; font-weight: 700; }
+    .settings-form button { grid-column: 1 / -1; }
     input {
       min-width: 0;
       border: 1px solid var(--line);
@@ -996,29 +922,29 @@ String generateHTML() {
       flex-wrap: wrap;
     }
     .fault { color: var(--warn); font-weight: 700; }
+    .network { margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--line); }
+    .network h2 { margin: 0 0 10px; font-size: 18px; }
+    .network-state { margin: 5px 0; color: var(--muted); font-size: 14px; }
+    .notice { margin: 10px 0; padding: 10px; border-radius: 8px; }
+    .notice-ok { background: #e7f7ef; color: #08734d; }
+    .notice-error { background: #fdecea; color: var(--warn); }
+    select { border: 1px solid var(--line); border-radius: 8px; padding: 12px; font-size: 16px; }
     @media (max-width: 460px) {
-      .grid, form, .actions { grid-template-columns: 1fr; }
+      .grid, form, .actions, .settings-form { grid-template-columns: 1fr; }
+      .settings-form button { grid-column: 1; }
     }
   </style>
 </head>
 <body>
   <main class="panel">
     <h1>Управление ТЭНом</h1>
-    <p class="sub">Реле 1 и 2 включаются вместе: фаза и ноль нагревателя.</p>
+    <p class="sub">Термостат управляет контактором ТЭНа через реле 4.</p>
     <section class="grid">
       <div class="cell">
-        <div class="label">Текущая температура</div>
+        <div class="label">Температура AD8495</div>
         <div class="value"><span id="temperature">)rawliteral";
 
   html += formatTemperatureValue();
-
-  html += R"rawliteral(</span> <span class="unit">°C</span></div>
-      </div>
-      <div class="cell">
-        <div class="label">Термопара AD8495</div>
-        <div class="value"><span id="ad8495Temperature">)rawliteral";
-
-  html += formatAD8495TemperatureValue();
 
   html += R"rawliteral(</span> <span class="unit">°C</span></div>
       </div>
@@ -1031,28 +957,67 @@ String generateHTML() {
   html += R"rawliteral(</span> <span class="unit">°C</span></div>
       </div>
     </section>
-    <form action="/set" method="get">
-      <input id="targetInput" name="target" type="number" step="0.5" min="0" max="300" value=")rawliteral";
+    <form class="settings-form" action="/thermostat/set" method="get">
+      <div class="field">
+        <label for="targetInput">Уставка, °C</label>
+        <input id="targetInput" name="target" type="number" step="0.5" min="10" max="300" value=")rawliteral";
 
   html += String(targetTemperatureC, 1);
 
   html += R"rawliteral(">
-      <button id="setButton" type="submit">Задать</button>
+      </div>
+      <div class="field">
+        <label for="hysteresisInput">Гистерезис, °C</label>
+        <input id="hysteresisInput" name="hysteresis" type="number" step="0.1" min="0.5" max="50" value=")rawliteral";
+
+  html += String(thermostatHysteresisC, 1);
+
+  html += R"rawliteral(">
+      </div>
+      <div class="field">
+        <label for="minOnInput">Минимальное время включения, с</label>
+        <input id="minOnInput" name="min_on" type="number" min="0" max="3600" value=")rawliteral";
+
+  html += String(thermostatMinOnSeconds);
+
+  html += R"rawliteral(">
+      </div>
+      <div class="field">
+        <label for="minOffInput">Минимальное время выключения, с</label>
+        <input id="minOffInput" name="min_off" type="number" min="0" max="3600" value=")rawliteral";
+
+  html += String(thermostatMinOffSeconds);
+
+  html += R"rawliteral(">
+      </div>
+      <div class="field">
+        <label for="emergencyInput">Аварийная температура, °C</label>
+        <input id="emergencyInput" name="emergency" type="number" step="0.5" min="10" max="300" value=")rawliteral";
+
+  html += String(emergencyTemperatureC, 1);
+
+  html += R"rawliteral(">
+      </div>
+      <div class="field">
+        <label for="anticipationInput">Упреждение и автоподстройка</label>
+        <select id="anticipationInput" name="anticipation">
+          <option value="1")rawliteral";
+  if (anticipationEnabled) html += " selected";
+  html += R"rawliteral(>Включены</option>
+          <option value="0")rawliteral";
+  if (!anticipationEnabled) html += " selected";
+  html += R"rawliteral(>Выключены</option>
+        </select>
+      </div>
+      <button id="setButton" type="submit">Сохранить параметры</button>
     </form>
+    <div id="actionMessage" class="fault" role="alert"></div>
     <div class="actions">
       <form action="/heat/on" method="get">
         <button id="heatOnButton" type="submit">Включить нагрев</button>
       </form>
       <form action="/heat/off" method="get">
         <button id="heatOffButton" class="stop" type="submit">Выключить нагрев</button>
-      </form>
-    </div>
-    <div class="actions">
-      <form id="autotuneStartForm" action="/autotune/start" method="get">
-        <button id="autotuneStartButton" type="submit">Быстрый автотюнинг</button>
-      </form>
-      <form id="autotuneStopForm" action="/autotune/stop" method="get">
-        <button id="autotuneStopButton" class="stop" type="submit">Остановить</button>
       </form>
     </div>
     <div class="actions">
@@ -1067,14 +1032,9 @@ String generateHTML() {
       </form>
     </div>
     <div class="status">
-      <span>Мощность: <b id="power">)rawliteral";
+      <span>Контактор ТЭНа: <b id="heater">)rawliteral";
 
-  html += String(heaterPowerPercent, 1);
-
-  html += R"rawliteral(</b>%</span>
-      <span>ТЭН: <b id="heater">)rawliteral";
-
-  html += heaterRelaysOn ? "вкл" : "выкл";
+  html += heaterContactorOn ? "вкл" : "выкл";
 
   html += R"rawliteral(</b></span>
       <span>Нагрев: <b id="enabled">)rawliteral";
@@ -1082,87 +1042,146 @@ String generateHTML() {
   html += heatingEnabled ? "включен" : "выключен";
 
   html += R"rawliteral(</b></span>
+      <span>Блокировка: <b id="relayLock">)rawliteral";
+
+  html += String(contactorLockSeconds(millis()));
+
+  html += R"rawliteral(</b> с</span>
       <span>Мотор: <b id="motorDirection">)rawliteral";
 
   html += motorDirectionText();
 
   html += R"rawliteral(</b></span>
-      <span>Автотюнинг: <b id="autotune">)rawliteral";
-
-  html += autotuneStatus;
-
-  html += R"rawliteral(</b></span>
     </div>
     <div class="status">
-      <span>Kp: <b id="kp">)rawliteral";
+      <span>Гистерезис: <b id="hysteresis">)rawliteral";
 
-  html += String(pidKp, 3);
+  html += String(thermostatHysteresisC, 1);
 
-  html += R"rawliteral(</b></span>
-      <span>Ki: <b id="ki">)rawliteral";
+  html += R"rawliteral(</b> °C</span>
+      <span>Мин. ON: <b id="minOn">)rawliteral";
 
-  html += String(pidKi, 5);
+  html += String(thermostatMinOnSeconds);
 
-  html += R"rawliteral(</b></span>
-      <span>Kd: <b id="kd">)rawliteral";
+  html += R"rawliteral(</b> с</span>
+      <span>Мин. OFF: <b id="minOff">)rawliteral";
 
-  html += String(pidKd, 3);
+  html += String(thermostatMinOffSeconds);
 
-  html += R"rawliteral(</b></span>
-      <span>Точки: <b id="cycles">)rawliteral";
+  html += R"rawliteral(</b> с</span>
+      <span>Авария: <b id="emergency">)rawliteral";
 
-  html += String(autotuneCycles);
+  html += String(emergencyTemperatureC, 1);
 
-  html += R"rawliteral(</b></span>
-      <span>RTD wires: <b id="rtdWires">3</b></span>
-      <span>Fault HEX: <b id="faultHex">0x00</b></span>
-      <span>RTD RAW: <b id="rtdRaw">0</b></span>
-      <span>RTD Ω: <b id="rtdOhm">0.000</b></span>
+  html += R"rawliteral(</b> °C</span>
       <span>AD8495: <b id="ad8495Mv">0.0</b> mV</span>
       <span>Открытие осталось: <b id="motorOpenRemaining">0</b> с</span>
     </div>
+    <div class="status">
+      <span>Расчетный порог включения: <b id="onThreshold">-</b> °C</span>
+      <span>Расчетный порог выключения: <b id="offThreshold">-</b> °C</span>
+      <span>Скорость температуры: <b id="temperatureRate">-</b> °C/мин</span>
+      <span>Завершено этапов подстройки: <b id="learnedCycles">0</b></span>
+    </div>
+    <section class="network">
+      <h2>Ethernet / Modbus TCP</h2>
+)rawliteral";
+
+  if (networkSettingsMessage.length() > 0) {
+    html += "<div class=\"notice ";
+    html += networkSettingsSaved ? "notice-ok" : "notice-error";
+    html += "\">" + networkSettingsMessage + "</div>";
+  }
+
+  html += R"rawliteral(
+      <div class="network-state">Состояние W5500: <b>)rawliteral";
+  html += ethernetConnectionText();
+  html += R"rawliteral(</b></div>
+      <div class="network-state">Текущий IP: <b>)rawliteral";
+  html += Ethernet.localIP().toString();
+  html += R"rawliteral(</b></div>
+      <div class="network-state">Порт Modbus TCP: <b>502</b>, Unit ID: <b>1</b></div>
+      <div class="network-state">Клиент: <b>)rawliteral";
+  html += modbusClientText();
+  html += R"rawliteral(</b></div>
+      <form id="networkForm" class="settings-form" action="/network" method="post">
+        <div class="field">
+          <label for="networkMode">Получение адреса</label>
+          <select id="networkMode" name="mode" onchange="updateNetworkMode()">
+            <option value="static")rawliteral";
+  if (!ethernetUseDhcp) html += " selected";
+  html += R"rawliteral(>Статический IP</option>
+            <option value="dhcp")rawliteral";
+  if (ethernetUseDhcp) html += " selected";
+  html += R"rawliteral(>DHCP</option>
+          </select>
+        </div>
+        <div class="field"><label for="networkIp">IP-адрес</label><input class="static-network-field" id="networkIp" name="ip" value=")rawliteral";
+  html += ethernetIp.toString();
+  html += R"rawliteral("></div>
+        <div class="field"><label for="networkSubnet">Маска подсети</label><input class="static-network-field" id="networkSubnet" name="subnet" value=")rawliteral";
+  html += ethernetSubnet.toString();
+  html += R"rawliteral("></div>
+        <div class="field"><label for="networkGateway">Шлюз</label><input class="static-network-field" id="networkGateway" name="gateway" value=")rawliteral";
+  html += ethernetGateway.toString();
+  html += R"rawliteral("></div>
+        <div class="field"><label for="networkDns">DNS</label><input class="static-network-field" id="networkDns" name="dns" value=")rawliteral";
+  html += ethernetDns.toString();
+  html += R"rawliteral("></div>
+        <button type="submit">Сохранить и применить</button>
+      </form>
+    </section>
     <div id="fault" class="status fault"></div>
   </main>
   <script>
+    function updateNetworkMode() {
+      const disabled = document.getElementById('networkMode').value === 'dhcp';
+      document.querySelectorAll('.static-network-field').forEach(function (field) { field.disabled = disabled; });
+    }
+
     async function refreshStatus() {
       const response = await fetch('/api/status', { cache: 'no-store' });
       const data = await response.json();
-      const busy = data.autotune_active;
       document.getElementById('temperature').textContent = data.temperature === null ? 'Нет данных' : data.temperature.toFixed(2);
-      document.getElementById('ad8495Temperature').textContent = data.ad8495_temperature === null ? 'Нет данных' : data.ad8495_temperature.toFixed(2);
-      const targetInput = document.getElementById('targetInput');
       document.getElementById('target').textContent = data.target.toFixed(1);
-      if (document.activeElement !== targetInput) {
-        targetInput.value = data.target.toFixed(1);
-      }
-      document.getElementById('power').textContent = data.power.toFixed(1);
+      const fields = {
+        targetInput: data.target.toFixed(1),
+        hysteresisInput: data.hysteresis.toFixed(1),
+        minOnInput: data.min_on_seconds,
+        minOffInput: data.min_off_seconds,
+        emergencyInput: data.emergency_temperature.toFixed(1),
+        anticipationInput: data.anticipation_enabled ? '1' : '0'
+      };
+      Object.entries(fields).forEach(function ([id, value]) {
+        const field = document.getElementById(id);
+        if (document.activeElement !== field && field.dataset.dirty !== '1') field.value = value;
+      });
+      document.getElementById('onThreshold').textContent = data.on_threshold.toFixed(1);
+      document.getElementById('offThreshold').textContent = data.off_threshold.toFixed(1);
+      document.getElementById('temperatureRate').textContent = data.temperature_rate.toFixed(2);
+      document.getElementById('learnedCycles').textContent = data.learned_cycles;
+      document.getElementById('hysteresis').textContent = data.hysteresis.toFixed(1);
+      document.getElementById('minOn').textContent = data.min_on_seconds;
+      document.getElementById('minOff').textContent = data.min_off_seconds;
+      document.getElementById('emergency').textContent = data.emergency_temperature.toFixed(1);
+      document.getElementById('relayLock').textContent = data.relay_lock_seconds;
       document.getElementById('heater').textContent = data.heater_on ? 'вкл' : 'выкл';
       document.getElementById('enabled').textContent = data.heating_enabled ? 'включен' : 'выключен';
       document.getElementById('motorDirection').textContent = data.motor_direction_text || 'Стоп';
-      document.getElementById('autotune').textContent = data.autotune_status;
-      document.getElementById('cycles').textContent = data.autotune_cycles;
-      document.getElementById('kp').textContent = data.kp.toFixed(3);
-      document.getElementById('ki').textContent = data.ki.toFixed(5);
-      document.getElementById('kd').textContent = data.kd.toFixed(3);
-      document.getElementById('faultHex').textContent = data.fault_hex || '0x00';
-      document.getElementById('rtdRaw').textContent = (data.rtd_raw ?? 0).toString();
-      document.getElementById('rtdOhm').textContent = (data.rtd_ohm == null ? 'N/A' : Number(data.rtd_ohm).toFixed(3));
       document.getElementById('ad8495Mv').textContent = data.ad8495_mv == null ? 'N/A' : Number(data.ad8495_mv).toFixed(1);
-      document.getElementById('rtdWires').textContent = (data.rtd_wires ?? 3).toString();
       document.getElementById('motorOpenRemaining').textContent = (data.motor_open_remaining_sec ?? 0).toString();
       document.getElementById('fault').textContent = data.fault ? data.fault_text : '';
-      targetInput.disabled = busy;
-      document.getElementById('setButton').disabled = busy;
-      document.getElementById('heatOnButton').disabled = busy || data.heating_enabled;
-      document.getElementById('heatOffButton').disabled = busy || !data.heating_enabled;
-      document.getElementById('autotuneStartButton').disabled = busy;
-      document.getElementById('autotuneStopButton').disabled = !busy;
+      document.getElementById('heatOnButton').disabled = data.heating_enabled;
+      document.getElementById('heatOffButton').disabled = !data.heating_enabled;
       document.getElementById('motorOpenButton').disabled = data.motor_direction === 1 || (data.motor_open_remaining_sec ?? 0) === 0;
       document.getElementById('motorCloseButton').disabled = data.motor_direction === 2 || data.di6_active;
       document.getElementById('motorStopButton').disabled = data.motor_direction === 0;
     }
 
-    document.querySelectorAll('form').forEach(function (form) {
+    document.querySelectorAll('form:not(#networkForm)').forEach(function (form) {
+      form.querySelectorAll('input,select').forEach(function (field) {
+        field.addEventListener('input', function () { field.dataset.dirty = '1'; });
+      });
       form.addEventListener('submit', async function (event) {
         event.preventDefault();
         const url = new URL(form.action, window.location.origin);
@@ -1172,16 +1191,27 @@ String generateHTML() {
         url.searchParams.set('ajax', '1');
 
         const buttons = form.querySelectorAll('button');
+        const sentFields = Array.from(form.querySelectorAll('input,select')).map(field => [field, field.value]);
         buttons.forEach(function (button) { button.disabled = true; });
+        const message = document.getElementById('actionMessage');
+        message.textContent = '';
         try {
-          await fetch(url.toString(), { cache: 'no-store' });
+          const response = await fetch(url.toString(), { cache: 'no-store' });
+          if (!response.ok) throw new Error(await response.text());
+          sentFields.forEach(function ([field, value]) {
+            if (field.value === value) delete field.dataset.dirty;
+          });
+        } catch (error) {
+          message.textContent = error.message;
         } finally {
-          await refreshStatus();
+          buttons.forEach(function (button) { button.disabled = false; });
+          try { await refreshStatus(); } catch (error) { message.textContent = 'Нет связи с контроллером'; }
         }
       });
     });
 
     setInterval(refreshStatus, 1000);
+    updateNetworkMode();
     refreshStatus();
   </script>
 </body>
@@ -1205,56 +1235,64 @@ void sendActionDone() {
   server.send(302, "text/plain", "");
 }
 
-void handleSetTarget() {
-  if (autotuneActive) {
-    server.send(409, "text/plain; charset=UTF-8", "Автотюнинг активен");
-    return;
-  }
-
-  if (!server.hasArg("target")) {
-    server.send(400, "text/plain; charset=UTF-8", "Нет уставки");
+void handleSetThermostat() {
+  if (!server.hasArg("target") || !server.hasArg("hysteresis") ||
+      !server.hasArg("min_on") || !server.hasArg("min_off") || !server.hasArg("emergency")) {
+    server.send(400, "text/plain; charset=UTF-8", "Не все параметры переданы");
     return;
   }
 
   float requestedTarget = server.arg("target").toFloat();
+  float requestedHysteresis = server.arg("hysteresis").toFloat();
+  long requestedMinOn = server.arg("min_on").toInt();
+  long requestedMinOff = server.arg("min_off").toInt();
+  float requestedEmergency = server.arg("emergency").toFloat();
+  bool requestedAnticipation = anticipationEnabled;
+  if (server.hasArg("anticipation")) {
+    if (server.arg("anticipation") != "0" && server.arg("anticipation") != "1") {
+      server.send(400, "text/plain; charset=UTF-8", "Упреждение должно быть 0 или 1");
+      return;
+    }
+    requestedAnticipation = server.arg("anticipation") == "1";
+  }
+  if (!isfinite(requestedTarget) || !isfinite(requestedHysteresis) || !isfinite(requestedEmergency)) {
+    server.send(400, "text/plain; charset=UTF-8", "Некорректное числовое значение");
+    return;
+  }
   if (requestedTarget < MIN_TARGET_C || requestedTarget > MAX_TARGET_C) {
     server.send(400, "text/plain; charset=UTF-8", "Уставка вне диапазона");
     return;
   }
+  if (requestedHysteresis < MIN_HYSTERESIS_C || requestedHysteresis > MAX_HYSTERESIS_C ||
+      requestedMinOn < 0 || requestedMinOn > MAX_MIN_SWITCH_SECONDS ||
+      requestedMinOff < 0 || requestedMinOff > MAX_MIN_SWITCH_SECONDS ||
+      requestedEmergency < requestedTarget || requestedEmergency > SENSOR_MAX_C) {
+    server.send(400, "text/plain; charset=UTF-8", "Параметры термостата вне диапазона");
+    return;
+  }
 
   setTargetTemperature(requestedTarget);
-  faultActive = false;
-  faultText = "";
+  thermostatHysteresisC = requestedHysteresis;
+  thermostatMinOnSeconds = static_cast<uint16_t>(requestedMinOn);
+  thermostatMinOffSeconds = static_cast<uint16_t>(requestedMinOff);
+  emergencyTemperatureC = requestedEmergency;
+  anticipation.cancelCycle();
+  if (anticipationEnabled != requestedAnticipation) anticipation.reset();
+  anticipationEnabled = requestedAnticipation;
+  saveThermostatSettings();
 
-  sendActionDone();
-}
-
-void handleAutotuneStart() {
-  faultActive = false;
-  faultText = "";
-  startAutotune();
   sendActionDone();
 }
 
 void handleHeatOn() {
-  if (autotuneActive) {
-    server.send(409, "text/plain; charset=UTF-8", "Автотюнинг активен");
-    return;
-  }
-
   faultActive = false;
-  faultText = "";
+  faultText = sensorFault ? "Температура AD8495 вне диапазона 10...300 °C" : "";
   setHeatingEnabled(true);
   sendActionDone();
 }
 
 void handleHeatOff() {
   setHeatingEnabled(false);
-  sendActionDone();
-}
-
-void handleAutotuneStop() {
-  stopAutotune("Остановлен вручную", false);
   sendActionDone();
 }
 
@@ -1277,6 +1315,59 @@ void handleStatus() {
   server.send(200, "application/json; charset=UTF-8", statusJson());
 }
 
+void handleNetworkSettings() {
+  if (heatingEnabled || currentDirection != MOTOR_STOP) {
+    networkSettingsSaved = false;
+    networkSettingsMessage = "Настройки сети можно менять только при выключенном нагреве и остановленном моторе.";
+    server.send(409, "text/html; charset=UTF-8", generateHTML());
+    return;
+  }
+  if (!server.hasArg("mode") || (server.arg("mode") != "static" && server.arg("mode") != "dhcp")) {
+    networkSettingsSaved = false;
+    networkSettingsMessage = "Выберите режим получения IP-адреса.";
+    server.send(400, "text/html; charset=UTF-8", generateHTML());
+    return;
+  }
+
+  bool newUseDhcp = server.arg("mode") == "dhcp";
+  IPAddress newIp, newSubnet, newGateway, newDns;
+  if (!newUseDhcp &&
+      (!server.hasArg("ip") || !server.hasArg("subnet") || !server.hasArg("gateway") || !server.hasArg("dns") ||
+       !parseIPv4(server.arg("ip"), newIp) || !parseIPv4(server.arg("subnet"), newSubnet) ||
+       !parseIPv4(server.arg("gateway"), newGateway) || !parseIPv4(server.arg("dns"), newDns))) {
+    networkSettingsSaved = false;
+    networkSettingsMessage = "Ошибка: проверьте формат IPv4-адресов.";
+    server.send(400, "text/html; charset=UTF-8", generateHTML());
+    return;
+  }
+
+  bool oldDhcp = ethernetUseDhcp;
+  IPAddress oldIp = ethernetIp, oldSubnet = ethernetSubnet, oldGateway = ethernetGateway, oldDns = ethernetDns;
+  ethernetUseDhcp = newUseDhcp;
+  if (!newUseDhcp) {
+    ethernetIp = newIp;
+    ethernetSubnet = newSubnet;
+    ethernetGateway = newGateway;
+    ethernetDns = newDns;
+  }
+  if (!saveNetworkSettings()) {
+    ethernetUseDhcp = oldDhcp;
+    ethernetIp = oldIp;
+    ethernetSubnet = oldSubnet;
+    ethernetGateway = oldGateway;
+    ethernetDns = oldDns;
+    networkSettingsSaved = false;
+    networkSettingsMessage = "Не удалось сохранить настройки сети.";
+    server.send(500, "text/html; charset=UTF-8", generateHTML());
+    return;
+  }
+
+  applyEthernetSettings();
+  networkSettingsSaved = true;
+  networkSettingsMessage = "Настройки сохранены. Текущий IP W5500: " + Ethernet.localIP().toString();
+  handleRoot();
+}
+
 void handleRedirectToRoot() {
   server.sendHeader("Location", String("http://") + WiFi.softAPIP().toString() + "/", true);
   server.send(302, "text/plain", "");
@@ -1284,7 +1375,7 @@ void handleRedirectToRoot() {
 
 void setup() {
   Serial.begin(115200);
-  loadPidSettings();
+  loadThermostatSettings();
 
   pinMode(ANALOG_A1, INPUT);
   analogReadResolution(12);
@@ -1296,19 +1387,10 @@ void setup() {
   updateDI6State();
   runStartupOpenCycle();
 
-  pinMode(MAX31865_CS_PIN, OUTPUT);
-  digitalWrite(MAX31865_CS_PIN, HIGH);
-  SPI.begin(MAX31865_SCK_PIN, MAX31865_MISO_PIN, MAX31865_MOSI_PIN, MAX31865_CS_PIN);
-  rtd.begin(MAX31865_WIRES);
-  ledcSetup(SSR_PWM_CHANNEL, SSR_PWM_FREQ_HZ, SSR_PWM_RESOLUTION_BITS);
-  ledcAttachPin(SSR_PWM_PIN, SSR_PWM_CHANNEL);
-  setSsrPwmPercent(0.0f);
-
-  RS485Serial.begin(RS485_BAUDRATE, SERIAL_8N1, RS485_RX_PIN, RS485_TX_PIN);
-  mb.begin(&RS485Serial);
-  mb.slave(MODBUS_SLAVE_ID);
-  mb.addHreg(REG_STATUS_BITS, 0, REG_REG_COUNT);
-  mb.Hreg(REG_COMMAND_RESULT, CMD_RES_OK);
+  SPI.begin();
+  Ethernet.init(W5500_CS_PIN);
+  loadNetworkSettings();
+  applyEthernetSettings();
   syncModbusRegistersFromState();
 
   delay(250);
@@ -1318,15 +1400,14 @@ void setup() {
   dnsServer.start(DNS_PORT, "*", WiFi.softAPIP());
 
   server.on("/", HTTP_GET, handleRoot);
-  server.on("/set", HTTP_GET, handleSetTarget);
+  server.on("/thermostat/set", HTTP_GET, handleSetThermostat);
   server.on("/heat/on", HTTP_GET, handleHeatOn);
   server.on("/heat/off", HTTP_GET, handleHeatOff);
-  server.on("/autotune/start", HTTP_GET, handleAutotuneStart);
-  server.on("/autotune/stop", HTTP_GET, handleAutotuneStop);
   server.on("/motor/open", HTTP_GET, handleMotorOpen);
   server.on("/motor/close", HTTP_GET, handleMotorClose);
   server.on("/motor/stop", HTTP_GET, handleMotorStop);
   server.on("/api/status", HTTP_GET, handleStatus);
+  server.on("/network", HTTP_POST, handleNetworkSettings);
     
   server.on("/generate_204", HTTP_GET, handleRedirectToRoot);
   server.on("/hotspot-detect.html", HTTP_GET, handleRedirectToRoot);
@@ -1334,11 +1415,13 @@ void setup() {
   server.onNotFound(handleRedirectToRoot);
 
   server.begin();
-  resetPid();
 
   Serial.print("AP IP: ");
   Serial.println(WiFi.softAPIP());
-  Serial.printf("PID: Kp = %.3f, Ki = %.5f, Kd = %.3f\n", pidKp, pidKi, pidKd);
+  Serial.print("Ethernet IP: ");
+  Serial.println(Ethernet.localIP());
+  Serial.printf("Thermostat: target=%.1f C, hysteresis=%.1f C, min ON=%u s, min OFF=%u s\n",
+                targetTemperatureC, thermostatHysteresisC, thermostatMinOnSeconds, thermostatMinOffSeconds);
 }
 
 void loop() {
@@ -1346,51 +1429,44 @@ void loop() {
   server.handleClient();
   updateDI6State();
   updateMotorControl();
-  mb.task();
-  handleModbusCommand();
-  applyModbusWritableRegisters();
+  if (ethernetUseDhcp) Ethernet.maintain();
+  handleModbusTcp();
 
   uint32_t now = millis();
   if ((now - lastSensorReadMs) >= SENSOR_READ_INTERVAL_MS || lastSensorReadMs == 0) {
     lastSensorReadMs = now;
-    ad8495TemperatureC = readAD8495C();
-    float rawTemperatureC = readStableMAX31865C(thermoOpenCircuit);
-    if (!thermoOpenCircuit && !isnan(rawTemperatureC)) {
+    float rawTemperatureC = readAD8495C();
+    lastRawTemperatureC = rawTemperatureC;
+    sensorFault = !isfinite(rawTemperatureC) || rawTemperatureC < SENSOR_MIN_C || rawTemperatureC > SENSOR_MAX_C;
+    if (!sensorFault) {
       if (isnan(lastTemperatureC)) {
         lastTemperatureC = rawTemperatureC;
       } else {
         lastTemperatureC = (TEMP_FILTER_ALPHA * rawTemperatureC) + ((1.0f - TEMP_FILTER_ALPHA) * lastTemperatureC);
       }
+      if (!faultActive) {
+        faultText = "";
+      }
+      if (anticipationEnabled && heatingEnabled && !faultActive && currentDirection == MOTOR_STOP) {
+        anticipation.sample(lastTemperatureC, millis());
+      } else {
+        anticipation.resetSamples();
+      }
     } else {
       lastTemperatureC = NAN;
+      faultText = "Температура AD8495 вне диапазона 10...300 °C";
+      stopHeater("");
     }
 
-    if (thermoOpenCircuit) {
-      stopAutotune("Остановлен из-за ошибки датчика", false);
-      if (faultText.length() == 0) {
-        stopHeater("RTD датчик не подключен/ошибка MAX31865");
-      } else {
-        stopHeater(faultText);
-      }
-      Serial.print("MAX31865: ");
-      Serial.println(faultText);
-    } else if (!isnan(lastTemperatureC)) {
-      Serial.printf(
-        "T = %.2f C, target = %.1f C, power = %.1f%%, Kp = %.3f, Ki = %.5f, Kd = %.3f\n",
-        lastTemperatureC,
-        targetTemperatureC,
-        heaterPowerPercent,
-        pidKp,
-        pidKi,
-        pidKd
-      );
+    if (!sensorFault && !isnan(lastTemperatureC)) {
+      Serial.printf("T=%.2f C, target=%.1f C, contactor=%s\n",
+                    lastTemperatureC, targetTemperatureC, heaterContactorOn ? "ON" : "OFF");
     }
   }
 
-  updateAutotune(now);
-  computePid(now);
-  applyHeaterOutput();
+  updateThermostat(millis());
   syncModbusRegistersFromState();
+  handleModbusTcp();
   server.handleClient();
 }
 

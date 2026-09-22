@@ -1,95 +1,149 @@
 ﻿import inspect
 from collections import deque
+from dataclasses import dataclass
+import math
+import time
+from typing import Optional
 import tkinter as tk
 from tkinter import ttk, messagebox
 
-from pymodbus.client import ModbusSerialClient
+from pymodbus.client import ModbusTcpClient
 
 REG_STATUS_BITS = 0
 REG_TEMPERATURE_X10 = 1
 REG_TARGET_X10 = 2
-REG_POWER_X10 = 3
-REG_KP_X100 = 4
-REG_KI_X10000 = 5
-REG_KD_X100 = 6
+REG_HYSTERESIS_X10 = 3
+REG_MIN_ON_SECONDS = 4
+REG_MIN_OFF_SECONDS = 5
+REG_EMERGENCY_X10 = 6
 REG_COMMAND = 7
 REG_COMMAND_RESULT = 8
-REG_AUTOTUNE_CYCLES = 9
+REG_RELAY_LOCK_SECONDS = 9
 REG_FAULT_CODE = 10
 REG_HEATING_ENABLE = 11
-REG_AUTOTUNE_READY = 12
+REG_SENSOR_MV = 12
 REG_MOTOR_DIRECTION = 13
 REG_MOTOR_OPEN_REMAINING_SEC = 14
+REG_ANTICIPATION_ENABLE = 15
+REG_RATE_C_MIN_X100 = 16
+REG_ON_THRESHOLD_X10 = 17
+REG_OFF_THRESHOLD_X10 = 18
+REG_OFF_LOOKAHEAD_X10 = 19
+REG_ON_LOOKAHEAD_X10 = 20
+REG_LEARNED_CYCLES = 21
+REGISTER_COUNT = 22
 
 CMD_HEAT_ON = 1
 CMD_HEAT_OFF = 2
-CMD_AUTOTUNE_START = 3
-CMD_AUTOTUNE_STOP = 4
 CMD_CLEAR_FAULT = 5
-CMD_SAVE_PID = 6
+CMD_SAVE_THERMOSTAT = 6
 CMD_MOTOR_OPEN = 7
 CMD_MOTOR_CLOSE = 8
 CMD_MOTOR_STOP = 9
 NOISE_FILTER_ALPHA = 0.12
+HISTORY_SECONDS = 3600
+MAX_SAMPLE_GAP_SECONDS = 3.0
+GRAPH_SERIES = (
+    ("temperature", "Температура", "#0f8a5f", ()),
+    ("filtered", "Сглаженная (только график)", "#d97706", ()),
+    ("target", "Уставка", "#dc2626", ()),
+    ("on_threshold", "Порог включения", "#2563eb", (6, 3)),
+    ("off_threshold", "Порог выключения", "#64748b", (2, 3)),
+)
 
 CMD_RESULT_TEXT = {
-    0: "OK",
-    1: "UNKNOWN_CMD",
-    2: "BUSY",
-    3: "INVALID_ARG",
+    0: "Выполнено",
+    1: "Неизвестная команда",
+    2: "Занят",
+    3: "Некорректный параметр",
 }
 
 FAULT_TEXT = {
-    0: "NONE",
-    1: "THERMO_OPEN",
-    2: "EMERGENCY_TEMP",
+    0: "Нет аварии",
+    1: "Датчик вне диапазона",
+    2: "Аварийная температура",
 }
 
 MOTOR_DIRECTION_TEXT = {
-    0: "STOP",
-    1: "OPEN",
-    2: "CLOSE",
+    0: "Стоп",
+    1: "Открытие",
+    2: "Закрытие",
 }
+
+
+@dataclass
+class GraphSample:
+    timestamp: float
+    temperature: Optional[float]
+    filtered: Optional[float]
+    target: Optional[float]
+    on_threshold: Optional[float]
+    off_threshold: Optional[float]
+    contactor: Optional[bool]
 
 
 class App:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("RS-485 Modbus тест")
-        self.root.geometry("1000x680")
-        self.root.minsize(920, 560)
+        self.root.title("Modbus TCP тест гриля")
+        width = min(1120, max(1000, self.root.winfo_screenwidth() - 80))
+        height = min(860, max(660, self.root.winfo_screenheight() - 100))
+        self.root.geometry(f"{width}x{height}")
+        self.root.minsize(1000, 660)
         self.client = None
         self.connected = False
+        self._poll_job = None
+        self._syncing_fields = False
+        self._dirty_fields = set()
+        self._last_anticipation = False
+        self._history_device = None
+        self._latest_target = None
+        self._active_unit = None
 
-        self.port_var = tk.StringVar(value="COM4")
-        self.baud_var = tk.StringVar(value="9600")
+        self.host_var = tk.StringVar(value="192.168.1.51")
+        self.port_var = tk.StringVar(value="502")
         self.slave_var = tk.StringVar(value="1")
 
-        self.target_var = tk.StringVar(value="180.0")
-        self.kp_var = tk.StringVar(value="12.0")
-        self.ki_var = tk.StringVar(value="0.0800")
-        self.kd_var = tk.StringVar(value="8.0")
+        self.target_var = tk.StringVar(value="100.0")
+        self.hysteresis_var = tk.StringVar(value="2.0")
+        self.min_on_var = tk.StringVar(value="10")
+        self.min_off_var = tk.StringVar(value="10")
+        self.emergency_var = tk.StringVar(value="300.0")
+        self.anticipation_var = tk.BooleanVar(value=False)
 
         self.status_var = tk.StringVar(value="Не подключено")
         self.values_var = tk.StringVar(value="-")
-        self._pid_refresh_counter = 0
+        self.contactor_var = tk.StringVar(value="Контактор: нет данных")
+        self.anticipation_status_var = tk.StringVar(value="Упреждение: нет данных")
+        self.learning_var = tk.StringVar(value="Автоподстройка: нет данных")
 
         self.target_entry = None
-        self.kp_entry = None
-        self.ki_entry = None
-        self.kd_entry = None
+        self.hysteresis_entry = None
+        self.min_on_entry = None
+        self.min_off_entry = None
+        self.emergency_entry = None
         self.heat_on_button = None
         self.heat_off_button = None
         self.motor_open_button = None
         self.motor_close_button = None
         self.motor_stop_button = None
 
-        self.temp_history = deque(maxlen=3600)
-        self.power_history = deque(maxlen=3600)
-        self.target_history = deque(maxlen=3600)
+        self.history = deque(maxlen=7200)
+        self._filtered_temperature = None
         self.graph_canvas = None
 
         self._build_ui()
+        self._settings_fields = {
+            "target": (self.target_var, self.target_entry),
+            "hysteresis": (self.hysteresis_var, self.hysteresis_entry),
+            "min_on": (self.min_on_var, self.min_on_entry),
+            "min_off": (self.min_off_var, self.min_off_entry),
+            "emergency": (self.emergency_var, self.emergency_entry),
+        }
+        for name, (variable, _) in self._settings_fields.items():
+            variable.trace_add("write", lambda *_args, key=name: self._mark_edited(key))
+        self._disable_live_controls()
+        self.root.protocol("WM_DELETE_WINDOW", self.close)
         self._tick()
 
     def _build_ui(self):
@@ -103,11 +157,11 @@ class App:
         conn = ttk.LabelFrame(frm, text="Подключение", padding=8)
         conn.grid(row=0, column=0, sticky="ew")
 
-        ttk.Label(conn, text="COM:").grid(row=0, column=0, sticky="w")
-        ttk.Entry(conn, textvariable=self.port_var, width=12).grid(row=0, column=1, sticky="w")
-        ttk.Label(conn, text="Baud:").grid(row=0, column=2, sticky="w", padx=(8, 0))
-        ttk.Entry(conn, textvariable=self.baud_var, width=10).grid(row=0, column=3, sticky="w")
-        ttk.Label(conn, text="Slave ID:").grid(row=0, column=4, sticky="w", padx=(8, 0))
+        ttk.Label(conn, text="IP:").grid(row=0, column=0, sticky="w")
+        ttk.Entry(conn, textvariable=self.host_var, width=16).grid(row=0, column=1, sticky="w")
+        ttk.Label(conn, text="Порт:").grid(row=0, column=2, sticky="w", padx=(8, 0))
+        ttk.Entry(conn, textvariable=self.port_var, width=10).grid(row=0, column=3, sticky="w")
+        ttk.Label(conn, text="Unit ID:").grid(row=0, column=4, sticky="w", padx=(8, 0))
         ttk.Entry(conn, textvariable=self.slave_var, width=8).grid(row=0, column=5, sticky="w")
 
         ttk.Button(conn, text="Подключить", command=self.connect).grid(row=0, column=6, padx=(8, 0))
@@ -121,41 +175,62 @@ class App:
         self.target_entry.grid(row=0, column=1, sticky="w")
         ttk.Button(ctrl, text="Записать уставку", command=self.write_target).grid(row=0, column=2, padx=6)
 
-        ttk.Label(ctrl, text="Kp:").grid(row=1, column=0, sticky="w")
-        self.kp_entry = ttk.Entry(ctrl, textvariable=self.kp_var, width=10)
-        self.kp_entry.grid(row=1, column=1, sticky="w")
-        ttk.Label(ctrl, text="Ki:").grid(row=1, column=2, sticky="w")
-        self.ki_entry = ttk.Entry(ctrl, textvariable=self.ki_var, width=10)
-        self.ki_entry.grid(row=1, column=3, sticky="w")
-        ttk.Label(ctrl, text="Kd:").grid(row=1, column=4, sticky="w")
-        self.kd_entry = ttk.Entry(ctrl, textvariable=self.kd_var, width=10)
-        self.kd_entry.grid(row=1, column=5, sticky="w")
-        ttk.Button(ctrl, text="Записать PID", command=self.write_pid).grid(row=1, column=6, padx=6)
+        ttk.Label(ctrl, text="Гистерезис °C:").grid(row=1, column=0, sticky="w")
+        self.hysteresis_entry = ttk.Entry(ctrl, textvariable=self.hysteresis_var, width=10)
+        self.hysteresis_entry.grid(row=1, column=1, sticky="w")
+        ttk.Label(ctrl, text="Мин. ON, с:").grid(row=1, column=2, sticky="w")
+        self.min_on_entry = ttk.Entry(ctrl, textvariable=self.min_on_var, width=10)
+        self.min_on_entry.grid(row=1, column=3, sticky="w")
+        ttk.Label(ctrl, text="Мин. OFF, с:").grid(row=1, column=4, sticky="w")
+        self.min_off_entry = ttk.Entry(ctrl, textvariable=self.min_off_var, width=10)
+        self.min_off_entry.grid(row=1, column=5, sticky="w")
+        ttk.Label(ctrl, text="Авария °C:").grid(row=2, column=0, sticky="w")
+        self.emergency_entry = ttk.Entry(ctrl, textvariable=self.emergency_var, width=10)
+        self.emergency_entry.grid(row=2, column=1, sticky="w")
+        ttk.Button(ctrl, text="Записать термостат", command=self.write_thermostat).grid(row=2, column=2, columnspan=2, padx=6)
+        self.anticipation_check = ttk.Checkbutton(
+            ctrl, text="Упреждение и автоподстройка",
+            variable=self.anticipation_var, command=self.write_anticipation,
+        )
+        self.anticipation_check.grid(row=2, column=4, columnspan=2, sticky="w")
 
-        self.heat_on_button = ttk.Button(ctrl, text="Нагрев ON", command=lambda: self.set_heating(True))
-        self.heat_on_button.grid(row=2, column=0, pady=8)
-        self.heat_off_button = ttk.Button(ctrl, text="Нагрев OFF", command=lambda: self.set_heating(False))
-        self.heat_off_button.grid(row=2, column=1, pady=8)
-        ttk.Button(ctrl, text="Автотюнинг START", command=lambda: self.send_command(CMD_AUTOTUNE_START)).grid(row=2, column=2, pady=8)
-        ttk.Button(ctrl, text="Автотюнинг STOP", command=lambda: self.send_command(CMD_AUTOTUNE_STOP)).grid(row=2, column=3, pady=8)
-        ttk.Button(ctrl, text="Сброс аварии", command=lambda: self.send_command(CMD_CLEAR_FAULT)).grid(row=2, column=4, pady=8)
-        ttk.Button(ctrl, text="Сохранить PID", command=lambda: self.send_command(CMD_SAVE_PID)).grid(row=2, column=5, pady=8)
-        self.motor_open_button = ttk.Button(ctrl, text="Мотор OPEN", command=lambda: self.send_command(CMD_MOTOR_OPEN))
-        self.motor_open_button.grid(row=3, column=0, pady=8)
-        self.motor_close_button = ttk.Button(ctrl, text="Мотор CLOSE", command=lambda: self.send_command(CMD_MOTOR_CLOSE))
-        self.motor_close_button.grid(row=3, column=1, pady=8)
-        self.motor_stop_button = ttk.Button(ctrl, text="Мотор STOP", command=lambda: self.send_command(CMD_MOTOR_STOP))
-        self.motor_stop_button.grid(row=3, column=2, pady=8)
+        self.heat_on_button = ttk.Button(ctrl, text="Нагрев ВКЛ", command=lambda: self.set_heating(True))
+        self.heat_on_button.grid(row=3, column=0, pady=4)
+        self.heat_off_button = ttk.Button(ctrl, text="Нагрев ВЫКЛ", command=lambda: self.set_heating(False))
+        self.heat_off_button.grid(row=3, column=1, pady=4)
+        ttk.Button(ctrl, text="Сброс аварии", command=lambda: self.send_command(CMD_CLEAR_FAULT)).grid(row=3, column=2, pady=4)
+        self.motor_open_button = ttk.Button(ctrl, text="Открыть", command=lambda: self.send_command(CMD_MOTOR_OPEN))
+        self.motor_open_button.grid(row=4, column=0, pady=4)
+        self.motor_close_button = ttk.Button(ctrl, text="Закрыть", command=lambda: self.send_command(CMD_MOTOR_CLOSE))
+        self.motor_close_button.grid(row=4, column=1, pady=4)
+        self.motor_stop_button = ttk.Button(ctrl, text="Стоп мотор", command=lambda: self.send_command(CMD_MOTOR_STOP))
+        self.motor_stop_button.grid(row=4, column=2, pady=4)
 
         stat = ttk.LabelFrame(frm, text="Статус", padding=8)
         stat.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        stat.columnconfigure(0, weight=1)
         ttk.Label(stat, textvariable=self.status_var).grid(row=0, column=0, sticky="w")
-        ttk.Label(stat, textvariable=self.values_var, justify="left", anchor="w", wraplength=940).grid(row=1, column=0, sticky="w")
+        self.contactor_label = ttk.Label(stat, textvariable=self.contactor_var, font=("Segoe UI", 10, "bold"))
+        self.contactor_label.grid(row=1, column=0, sticky="w")
+        values_label = ttk.Label(stat, textvariable=self.values_var, justify="left", anchor="w")
+        values_label.grid(row=2, column=0, sticky="ew")
+        ttk.Label(stat, textvariable=self.anticipation_status_var).grid(row=3, column=0, sticky="w")
+        ttk.Label(stat, textvariable=self.learning_var).grid(row=4, column=0, sticky="w")
+        stat.bind("<Configure>", lambda event: values_label.configure(wraplength=max(200, event.width - 24)))
 
-        graph = ttk.LabelFrame(frm, text="График температуры", padding=8)
+        graph = ttk.LabelFrame(frm, text="Температура и контактор: последние 60 минут", padding=8)
         graph.grid(row=3, column=0, sticky="nsew", pady=(8, 0))
         graph.columnconfigure(0, weight=1)
-        graph.rowconfigure(0, weight=1)
+        graph.rowconfigure(1, weight=1)
+        legend = ttk.Frame(graph)
+        legend.grid(row=0, column=0, sticky="ew")
+        for i, (_key, label, color, dash) in enumerate(GRAPH_SERIES):
+            ttk.Label(legend, text=label + (" (пунктир)" if dash else ""), foreground=color).grid(
+                row=i // 3, column=i % 3, sticky="w", padx=(0, 18),
+            )
+        ttk.Label(legend, text="Полоса контактора: ВКЛ / ВЫКЛ", foreground="#a16207").grid(
+            row=1, column=2, sticky="w",
+        )
 
         self.graph_canvas = tk.Canvas(
             graph,
@@ -165,25 +240,35 @@ class App:
             highlightthickness=1,
             highlightbackground="#cccccc",
         )
-        self.graph_canvas.grid(row=0, column=0, sticky="nsew")
+        self.graph_canvas.grid(row=1, column=0, sticky="nsew")
+        self.graph_canvas.bind("<Configure>", lambda _event: self._draw_graph())
 
     def connect(self):
         self.disconnect()
         try:
-            baud = int(self.baud_var.get())
-            self.client = ModbusSerialClient(
-                port=self.port_var.get().strip(),
-                baudrate=baud,
-                bytesize=8,
-                parity="N",
-                stopbits=1,
+            host = self.host_var.get().strip()
+            port = int(self.port_var.get())
+            unit = self._slave()
+            if not host or not 1 <= port <= 65535 or not 0 <= unit <= 255:
+                raise ValueError("Проверьте IP, порт (1...65535) и Unit ID (0...255)")
+            self.client = ModbusTcpClient(
+                host=host,
+                port=port,
                 timeout=1,
             )
             self.connected = bool(self.client.connect())
             self.status_var.set("Подключено" if self.connected else "Ошибка подключения")
+            if self.connected:
+                self._active_unit = unit
+                device = (host, port, unit)
+                if device != self._history_device:
+                    self.history.clear()
+                    self._filtered_temperature = None
+                    self._dirty_fields.clear()
+                    self._history_device = device
+                self.poll()
         except Exception as exc:
-            self.connected = False
-            self.status_var.set(f"Ошибка: {exc}")
+            self._mark_unavailable(str(exc))
 
     def disconnect(self):
         if self.client:
@@ -193,9 +278,55 @@ class App:
                 pass
         self.client = None
         self.connected = False
+        self._active_unit = None
+        self._mark_unavailable("Не подключено", record=bool(self.history))
+
+    def close(self):
+        if self._poll_job is not None:
+            self.root.after_cancel(self._poll_job)
+            self._poll_job = None
+        self.disconnect()
+        self.root.destroy()
+
+    def _disable_live_controls(self):
+        for widget in (
+            self.heat_on_button, self.motor_open_button,
+            self.motor_close_button, self.anticipation_check,
+        ):
+            widget.state(["disabled"])
+        # Keep manual OFF/STOP available during a failed status read.
+        for widget in (self.heat_off_button, self.motor_stop_button):
+            widget.state(["!disabled"] if self.connected else ["disabled"])
+
+    def _mark_unavailable(self, reason, record=True):
+        self.status_var.set(reason)
+        self.contactor_var.set("Контактор: нет актуальных данных")
+        self.contactor_label.configure(foreground="#64748b")
+        self.anticipation_status_var.set("Упреждение: нет актуальных данных")
+        self.learning_var.set("Автоподстройка: нет актуальных данных")
+        self.values_var.set("-")
+        self._latest_target = None
+        self._disable_live_controls()
+        if record:
+            self._append_history(None)
+        self._draw_graph()
+
+    def _mark_edited(self, name):
+        if not self._syncing_fields:
+            self._dirty_fields.add(name)
+
+    def _sync_settings(self, values):
+        self._syncing_fields = True
+        try:
+            for name, value in values.items():
+                variable, entry = self._settings_fields[name]
+                if name not in self._dirty_fields and not self._entry_focused(entry):
+                    variable.set(value)
+        finally:
+            self._syncing_fields = False
 
     def _slave(self):
-        return int(self.slave_var.get())
+        return self._active_unit if self._active_unit is not None else int(self.slave_var.get())
 
     def _call_with_slave(self, fn, *args, **kwargs):
         sid = self._slave()
@@ -218,6 +349,7 @@ class App:
     def send_command(self, cmd: int):
         try:
             self.write_reg(REG_COMMAND, cmd)
+            self.poll(record=False)
         except Exception as exc:
             messagebox.showerror("Modbus", str(exc))
 
@@ -226,25 +358,58 @@ class App:
             # Heating has its own RW register. Writing it directly avoids ambiguity
             # with the one-shot command register and mirrors the web UI state.
             self.write_reg(REG_HEATING_ENABLE, 1 if enabled else 0)
+            self.poll(record=False)
         except Exception as exc:
             messagebox.showerror("Modbus", str(exc))
 
     def write_target(self):
         try:
-            val = float(self.target_var.get())
+            val = float(self.target_var.get().replace(",", "."))
+            if not math.isfinite(val) or not 10 <= val <= 300:
+                raise ValueError("Уставка должна быть в пределах 10...300 °C")
             self.write_reg(REG_TARGET_X10, int(round(val * 10.0)) & 0xFFFF)
+            self._dirty_fields.discard("target")
+            self.poll(record=False)
         except Exception as exc:
             messagebox.showerror("Modbus", str(exc))
 
-    def write_pid(self):
+    def write_thermostat(self):
         try:
-            kp = float(self.kp_var.get())
-            ki = float(self.ki_var.get())
-            kd = float(self.kd_var.get())
-            self.write_reg(REG_KP_X100, int(round(kp * 100.0)))
-            self.write_reg(REG_KI_X10000, int(round(ki * 10000.0)))
-            self.write_reg(REG_KD_X100, int(round(kd * 100.0)))
+            hysteresis = float(self.hysteresis_var.get().replace(",", "."))
+            min_on = int(self.min_on_var.get())
+            min_off = int(self.min_off_var.get())
+            emergency = float(self.emergency_var.get().replace(",", "."))
+            if not math.isfinite(hysteresis) or not 0.5 <= hysteresis <= 50:
+                raise ValueError("Гистерезис должен быть в пределах 0,5...50 °C")
+            if not 0 <= min_on <= 3600 or not 0 <= min_off <= 3600:
+                raise ValueError("Минимальное время ON/OFF должно быть в пределах 0...3600 с")
+            if not math.isfinite(emergency) or not 10 <= emergency <= 300:
+                raise ValueError("Аварийная температура должна быть в пределах 10...300 °C")
+            if self._latest_target is None:
+                raise ValueError("Сначала получите актуальное состояние контроллера")
+            if emergency < self._latest_target:
+                raise ValueError("Аварийная температура не может быть ниже уставки контроллера")
+            self.write_reg(REG_HYSTERESIS_X10, int(round(hysteresis * 10.0)))
+            self.write_reg(REG_MIN_ON_SECONDS, min_on)
+            self.write_reg(REG_MIN_OFF_SECONDS, min_off)
+            self.write_reg(REG_EMERGENCY_X10, int(round(emergency * 10.0)))
+            self.write_reg(REG_COMMAND, CMD_SAVE_THERMOSTAT)
+            self._dirty_fields.difference_update(("hysteresis", "min_on", "min_off", "emergency"))
+            self.poll(record=False)
         except Exception as exc:
+            messagebox.showerror("Modbus", str(exc))
+
+    def write_anticipation(self):
+        requested = self.anticipation_var.get()
+        self.anticipation_check.state(["disabled"])
+        try:
+            self.write_reg(REG_ANTICIPATION_ENABLE, int(requested))
+            self.poll(record=False)
+            if self._last_anticipation != requested:
+                raise RuntimeError("Контроллер не подтвердил изменение упреждения")
+        except Exception as exc:
+            self.anticipation_var.set(self._last_anticipation)
+            self._mark_unavailable(f"Ошибка изменения упреждения: {exc}", record=False)
             messagebox.showerror("Modbus", str(exc))
 
     @staticmethod
@@ -256,9 +421,8 @@ class App:
         flags = [
             ("HEAT_EN", bool(status & (1 << 0))),
             ("RELAY_ON", bool(status & (1 << 1))),
-            ("AUTOTUNE", bool(status & (1 << 2))),
             ("FAULT", bool(status & (1 << 3))),
-            ("THERMO_OPEN", bool(status & (1 << 4))),
+            ("SENSOR_FAULT", bool(status & (1 << 4))),
             ("DI6_CLOSED", bool(status & (1 << 5))),
         ]
         return ", ".join(f"{name}={'1' if val else '0'}" for name, val in flags)
@@ -269,217 +433,226 @@ class App:
         except Exception:
             return False
 
-    def _draw_graph(self):
+    def _prune_history(self, now):
+        cutoff = now - HISTORY_SECONDS
+        while self.history and self.history[0].timestamp < cutoff:
+            self.history.popleft()
+
+    def _append_history(self, temperature, target=None, on_threshold=None,
+                        off_threshold=None, contactor=None, now=None):
+        now = time.monotonic() if now is None else now
+        if temperature is None or not math.isfinite(temperature):
+            temperature = None
+            self._filtered_temperature = None
+        elif (self._filtered_temperature is None or not self.history or
+              now - self.history[-1].timestamp > MAX_SAMPLE_GAP_SECONDS):
+            self._filtered_temperature = temperature
+        else:
+            self._filtered_temperature += NOISE_FILTER_ALPHA * (temperature - self._filtered_temperature)
+        self.history.append(GraphSample(
+            now, temperature, self._filtered_temperature, target,
+            on_threshold, off_threshold, contactor,
+        ))
+        self._prune_history(now)
+
+    def _draw_graph(self, now=None):
         if self.graph_canvas is None:
             return
-
+        now = time.monotonic() if now is None else now
+        self._prune_history(now)
         c = self.graph_canvas
         c.delete("all")
+        w, h = max(100, c.winfo_width()), max(120, c.winfo_height())
+        left, right, top, bottom = 56, 24, 16, 66
+        pw, ph = max(10, w - left - right), max(10, h - top - bottom)
+        plot_bottom = top + ph
+        samples = list(self.history)
 
-        w = max(100, int(c.winfo_width()))
-        h = max(100, int(c.winfo_height()))
-        left, right, top, bottom = 50, 44, 10, 28
-        pw = max(10, w - left - right)
-        ph = max(10, h - top - bottom)
+        def x_at(timestamp):
+            return left + pw * (timestamp - (now - HISTORY_SECONDS)) / HISTORY_SECONDS
 
-        c.create_rectangle(left, top, left + pw, top + ph, outline="#999")
+        c.create_rectangle(left, top, left + pw, plot_bottom, outline="#999")
+        for minute in range(0, 61, 10):
+            x = left + pw * minute / 60
+            c.create_line(x, top, x, plot_bottom, fill="#eeeeee")
+            c.create_text(x, plot_bottom + 12, text="сейчас" if minute == 60 else f"-{60 - minute} мин",
+                          fill="#666", font=("Segoe UI", 9))
 
-        vals = [v for v in self.temp_history if v is not None]
-        target_vals = [v for v in self.target_history if v is not None]
-        if not vals:
-            c.create_text(w // 2, h // 2, text="Нет данных", fill="#666", font=("Segoe UI", 11))
-            return
+        scale = [getattr(sample, key) for sample in samples for key, *_rest in GRAPH_SERIES
+                 if getattr(sample, key) is not None and math.isfinite(getattr(sample, key))]
+        if not scale:
+            c.create_text(left + pw / 2, top + ph / 2, text="Нет данных за последний час",
+                          fill="#666", font=("Segoe UI", 11))
+        else:
+            tmin, tmax = min(scale), max(scale)
+            margin = max(0.5, (tmax - tmin) * 0.1)
+            tmin, tmax = tmin - margin, tmax + margin
 
-        scale_vals = vals + target_vals
-        tmin = min(scale_vals)
-        tmax = max(scale_vals)
-        if abs(tmax - tmin) < 1.0:
-            tmin -= 0.5
-            tmax += 0.5
-        margin = max(0.5, (tmax - tmin) * 0.1)
-        tmin -= margin
-        tmax += margin
+            def y_at(value):
+                return top + ph * (tmax - value) / (tmax - tmin)
 
-        for i in range(5):
-            y = top + int(ph * i / 4)
-            t = tmax - (tmax - tmin) * i / 4
-            c.create_line(left, y, left + pw, y, fill="#f0f0f0")
-            c.create_text(left - 6, y, text=f"{t:.1f}", anchor="e", fill="#666", font=("Segoe UI", 9))
+            for i in range(5):
+                t = tmax - (tmax - tmin) * i / 4
+                y = y_at(t)
+                c.create_line(left, y, left + pw, y, fill="#f0f0f0")
+                c.create_text(left - 6, y, text=f"{t:.1f}", anchor="e",
+                              fill="#666", font=("Segoe UI", 9))
 
-        # Right axis: power in %
-        for i in range(5):
-            y = top + int(ph * i / 4)
-            p = 100 - int(100 * i / 4)
-            c.create_text(left + pw + 6, y, text=f"{p}", anchor="w", fill="#1f5fa8", font=("Segoe UI", 9))
+            # Draw separate segments: never bridge missing readings or a TCP outage.
+            for key, _label, color, dash in GRAPH_SERIES:
+                points = []
+                previous = None
 
-        n = len(self.temp_history)
-        pts = []
-        for i, t in enumerate(self.temp_history):
-            if t is None:
+                def flush():
+                    if len(points) >= 4:
+                        c.create_line(*points, fill=color, width=2, dash=dash, tags=(key,))
+                    elif points:
+                        x, y = points
+                        c.create_oval(x - 2, y - 2, x + 2, y + 2,
+                                      fill=color, outline=color, tags=(key,))
+
+                for sample in samples:
+                    value = getattr(sample, key)
+                    if (value is None or not math.isfinite(value) or
+                            (previous is not None and
+                             sample.timestamp - previous.timestamp > MAX_SAMPLE_GAP_SECONDS)):
+                        flush()
+                        points = []
+                        previous = None
+                    if value is None or not math.isfinite(value):
+                        continue
+                    x, y = x_at(sample.timestamp), y_at(value)
+                    if previous is not None and key == "target":
+                        points.extend((x, points[-1]))
+                    points.extend((x, y))
+                    previous = sample
+                flush()
+
+        band_y = plot_bottom + 30
+        c.create_rectangle(left, band_y, left + pw, band_y + 14, outline="#cbd5e1")
+        interval = None
+
+        def paint_interval():
+            if interval is not None:
+                start, end, enabled = interval
+                color = "#f59e0b" if enabled else "#cbd5e1"
+                c.create_rectangle(x_at(start), band_y + 1, x_at(end), band_y + 13,
+                                   fill=color, outline="", tags=("contactor",))
+
+        # Merge adjacent states instead of creating thousands of rectangles each second.
+        for index, sample in enumerate(samples):
+            if sample.contactor is None:
+                paint_interval()
+                interval = None
                 continue
-            x = left + int(pw * i / max(1, n - 1))
-            yn = (t - tmin) / max(0.001, (tmax - tmin))
-            y = top + int(ph * (1.0 - yn))
-            pts.append((x, y))
-
-        if len(pts) >= 2:
-            flat = []
-            for p in pts:
-                flat.extend(p)
-            c.create_line(*flat, fill="#0f8a5f", width=2, smooth=True)
-
-        # Noise-reduced temperature curve (EMA low-pass filter)
-        filt_pts = []
-        filt_temp = None
-        temps = list(self.temp_history)
-        for i, t in enumerate(temps):
-            if t is None:
+            until = samples[index + 1].timestamp if index + 1 < len(samples) else now
+            until = min(until, sample.timestamp + MAX_SAMPLE_GAP_SECONDS, now)
+            if until <= sample.timestamp:
                 continue
-            if filt_temp is None:
-                filt_temp = t
+            if interval is not None and interval[2] == sample.contactor and sample.timestamp <= interval[1]:
+                interval = (interval[0], until, interval[2])
             else:
-                filt_temp = (NOISE_FILTER_ALPHA * t) + ((1.0 - NOISE_FILTER_ALPHA) * filt_temp)
-            x = left + int(pw * i / max(1, n - 1))
-            yn = (filt_temp - tmin) / max(0.001, (tmax - tmin))
-            y = top + int(ph * (1.0 - yn))
-            filt_pts.append((x, y))
+                paint_interval()
+                interval = (sample.timestamp, until, sample.contactor)
+        paint_interval()
+        c.create_text(left, band_y + 24, anchor="w",
+                      text="Контактор: желтый = ВКЛ, серый = ВЫКЛ, пробел = нет данных",
+                      fill="#666", font=("Segoe UI", 9))
 
-        if len(filt_pts) >= 2:
-            flat = []
-            for p in filt_pts:
-                flat.extend(p)
-            c.create_line(*flat, fill="#f59e0b", width=2, smooth=True)
-
-        # Target temperature curve
-        target_pts = []
-        for i, target in enumerate(self.target_history):
-            if target is None:
-                continue
-            x = left + int(pw * i / max(1, n - 1))
-            yn = (target - tmin) / max(0.001, (tmax - tmin))
-            y = top + int(ph * (1.0 - yn))
-            target_pts.append((x, y))
-
-        if len(target_pts) >= 2:
-            flat = []
-            for p in target_pts:
-                flat.extend(p)
-            c.create_line(*flat, fill="#dc2626", width=2)
-
-        # Power curve (0..100%)
-        p_pts = []
-        for i, pwr in enumerate(self.power_history):
-            if pwr is None:
-                continue
-            x = left + int(pw * i / max(1, n - 1))
-            yn = max(0.0, min(1.0, pwr / 100.0))
-            y = top + int(ph * (1.0 - yn))
-            p_pts.append((x, y))
-
-        if len(p_pts) >= 2:
-            flat = []
-            for p in p_pts:
-                flat.extend(p)
-            c.create_line(*flat, fill="#1f5fa8", width=2, smooth=True)
-
-        c.create_text(left + 6, top + 12, anchor="w", text=f"Текущая: {vals[-1]:.2f} °C", fill="#0f8a5f", font=("Segoe UI", 10, "bold"))
-        latest_target = next((v for v in reversed(self.target_history) if v is not None), None)
-        if latest_target is not None:
-            c.create_text(left + 220, top + 28, anchor="w", text=f"Уставка: {latest_target:.1f} °C", fill="#dc2626", font=("Segoe UI", 10, "bold"))
-        latest_power = next((v for v in reversed(self.power_history) if v is not None), None)
-        if latest_power is not None:
-            c.create_text(left + 220, top + 12, anchor="w", text=f"Мощность: {latest_power:.1f} %", fill="#1f5fa8", font=("Segoe UI", 10, "bold"))
-        c.create_text(left + pw - 430, top + 12, anchor="w", text="Темп. (зелёный), Фильтр (оранжевый), Уставка (красный), Мощн. (синий)", fill="#444", font=("Segoe UI", 9))
-
-    def poll(self):
+    def poll(self, record=True):
         if not self.connected or not self.client:
             return
-
-        read_fn = self.client.read_holding_registers
-        params = inspect.signature(read_fn).parameters
-        kwargs = {}
-        if "count" in params:
-            kwargs["count"] = 16
-        rr = self._call_with_slave(read_fn, 0, **kwargs)
-
-        if rr.isError():
-            self.status_var.set(f"Ошибка чтения: {rr}")
-            return
-
+        rr = self._call_with_slave(self.client.read_holding_registers, 0, count=REGISTER_COUNT)
+        if rr is None or rr.isError():
+            raise RuntimeError(f"Ошибка чтения Modbus: {rr}")
         r = rr.registers
+        if len(r) < REGISTER_COUNT:
+            raise RuntimeError("Нужны регистры 0...21. Обновите прошивку контроллера")
+
         status = r[REG_STATUS_BITS]
         temp_raw = r[REG_TEMPERATURE_X10]
+        sensor_fault = bool(status & (1 << 4))
+        temperature = None if temp_raw == 0x8000 or sensor_fault else self._to_i16(temp_raw) / 10.0
+        temp_text = "нет данных" if temperature is None else f"{temperature:.1f}"
         target = self._to_i16(r[REG_TARGET_X10]) / 10.0
-        power = r[REG_POWER_X10] / 10.0
-        kp = r[REG_KP_X100] / 100.0
-        ki = r[REG_KI_X10000] / 10000.0
-        kd = r[REG_KD_X100] / 100.0
-        cmd_res = r[REG_COMMAND_RESULT]
-        cycles = r[REG_AUTOTUNE_CYCLES]
-        fault_code = r[REG_FAULT_CODE]
+        hysteresis = r[REG_HYSTERESIS_X10] / 10.0
+        min_on, min_off = r[REG_MIN_ON_SECONDS], r[REG_MIN_OFF_SECONDS]
+        emergency = r[REG_EMERGENCY_X10] / 10.0
+        cmd_res, fault_code = r[REG_COMMAND_RESULT], r[REG_FAULT_CODE]
+        relay_lock = r[REG_RELAY_LOCK_SECONDS]
         motor_direction = r[REG_MOTOR_DIRECTION]
         motor_open_remaining = r[REG_MOTOR_OPEN_REMAINING_SEC]
         heating_enabled = bool(status & (1 << 0))
         heater_relay_on = bool(status & (1 << 1))
-        autotune_active = bool(status & (1 << 2))
         lid_closed = bool(status & (1 << 5))
+        anticipation_enabled = bool(r[REG_ANTICIPATION_ENABLE])
+        rate = self._to_i16(r[REG_RATE_C_MIN_X100]) / 100.0
+        on_threshold = self._to_i16(r[REG_ON_THRESHOLD_X10]) / 10.0
+        off_threshold = self._to_i16(r[REG_OFF_THRESHOLD_X10]) / 10.0
+        off_seconds, on_seconds = r[REG_OFF_LOOKAHEAD_X10] / 10.0, r[REG_ON_LOOKAHEAD_X10] / 10.0
+        learned = r[REG_LEARNED_CYCLES]
+        fault = sensor_fault or bool(status & (1 << 3)) or fault_code != 0
+        self._latest_target = target
+        self._last_anticipation = anticipation_enabled
+        self.anticipation_var.set(anticipation_enabled)
+        self.anticipation_check.state(["!disabled"])
 
-        cmd_res_text = CMD_RESULT_TEXT.get(cmd_res, f"UNKNOWN({cmd_res})")
-        fault_text = FAULT_TEXT.get(fault_code, f"UNKNOWN({fault_code})")
-        status_text = self._decode_status_bits(status)
-
-        if temp_raw == 0x8000:
-            temp_text = "N/A"
-            self.temp_history.append(None)
-        else:
-            t = self._to_i16(temp_raw) / 10.0
-            temp_text = f"{t:.1f}"
-            self.temp_history.append(t)
-        self.power_history.append(power)
-        self.target_history.append(target)
-
+        self.status_var.set("Подключено, данные обновлены")
+        self.contactor_var.set(
+            f"Контактор: {'ВКЛ' if heater_relay_on else 'ВЫКЛ'}   |   "
+            f"Нагрев: {'разрешен' if heating_enabled else 'выключен'}   |   "
+            f"До разрешения переключения: {relay_lock} с"
+        )
+        self.contactor_label.configure(foreground="#a16207" if heater_relay_on else "#475569")
         lines = [
-            f"T={temp_text} °C  Target={target:.1f} °C  Power={power:.1f}%",
-            f"Heating={'ON' if heating_enabled else 'OFF'}  L/N relay={'ON' if heater_relay_on else 'OFF'}  Autotune={'ON' if autotune_active else 'OFF'}",
-            f"Kp={kp:.2f} Ki={ki:.4f} Kd={kd:.2f}",
-            f"StatusBits=0x{status:04X} [{status_text}]",
-            f"CmdResult={cmd_res} ({cmd_res_text})  Fault={fault_code} ({fault_text})  Cycles={cycles}",
-            f"Motor={motor_direction} ({MOTOR_DIRECTION_TEXT.get(motor_direction, 'UNKNOWN')})  OpenRemaining={motor_open_remaining}s",
+            f"Температура: {temp_text} °C   Уставка: {target:.1f} °C   Гистерезис: {hysteresis:.1f} °C   AD8495: {r[REG_SENSOR_MV]} мВ",
+            f"Мин. ON/OFF: {min_on}/{min_off} с   Авария: {emergency:.1f} °C   "
+            f"Мотор: {MOTOR_DIRECTION_TEXT.get(motor_direction, str(motor_direction))}, открытие осталось {motor_open_remaining} с",
+            f"StatusBits=0x{status:04X} [{self._decode_status_bits(status)}]",
+            f"CmdResult={cmd_res} ({CMD_RESULT_TEXT.get(cmd_res, 'Неизвестный результат')})   "
+            f"Fault={fault_code} ({FAULT_TEXT.get(fault_code, 'Неизвестная авария')})",
         ]
         self.values_var.set("\n".join(lines))
-
-        if not self._entry_focused(self.target_entry):
-            self.target_var.set(f"{target:.1f}")
-
-        self._pid_refresh_counter += 1
-        if self._pid_refresh_counter >= 5:
-            self._pid_refresh_counter = 0
-            if not self._entry_focused(self.kp_entry):
-                self.kp_var.set(f"{kp:.2f}")
-            if not self._entry_focused(self.ki_entry):
-                self.ki_var.set(f"{ki:.4f}")
-            if not self._entry_focused(self.kd_entry):
-                self.kd_var.set(f"{kd:.2f}")
-
-        if self.motor_open_button is not None:
-            self.motor_open_button.state(["disabled"] if motor_direction == 1 or motor_open_remaining == 0 else ["!disabled"])
-        if self.motor_close_button is not None:
-            self.motor_close_button.state(["disabled"] if motor_direction == 2 or lid_closed else ["!disabled"])
-        if self.motor_stop_button is not None:
-            self.motor_stop_button.state(["disabled"] if motor_direction == 0 else ["!disabled"])
-        if self.heat_on_button is not None:
-            self.heat_on_button.state(["disabled"] if heating_enabled or autotune_active else ["!disabled"])
-        if self.heat_off_button is not None:
-            self.heat_off_button.state(["disabled"] if not heating_enabled else ["!disabled"])
-
+        self.anticipation_status_var.set(
+            f"Упреждение: {'ВКЛ' if anticipation_enabled else 'ВЫКЛ'}   "
+            f"Расчетные пороги ВКЛ / ВЫКЛ: {on_threshold:.1f} / {off_threshold:.1f} °C   "
+            f"Скорость: {rate:+.2f} °C/мин"
+        )
+        if not anticipation_enabled:
+            learning = "выключена"
+        elif fault:
+            learning = "приостановлена: авария / датчик"
+        elif not heating_enabled:
+            learning = "ожидание включения нагрева"
+        elif motor_direction != 0:
+            learning = "приостановлена: движение крышки"
+        else:
+            learning = "наблюдение за температурой"
+        self.learning_var.set(
+            f"Автоподстройка: {learning}; этапов: {learned}   "
+            f"Упреждение ВКЛ / ВЫКЛ: {on_seconds:.1f} / {off_seconds:.1f} с"
+        )
+        self._sync_settings({
+            "target": f"{target:.1f}", "hysteresis": f"{hysteresis:.1f}",
+            "min_on": str(min_on), "min_off": str(min_off), "emergency": f"{emergency:.1f}",
+        })
+        self.motor_open_button.state(["disabled"] if motor_direction == 1 or motor_open_remaining == 0 else ["!disabled"])
+        self.motor_close_button.state(["disabled"] if motor_direction == 2 or lid_closed else ["!disabled"])
+        self.motor_stop_button.state(["disabled"] if motor_direction == 0 else ["!disabled"])
+        self.heat_on_button.state(["disabled"] if heating_enabled else ["!disabled"])
+        self.heat_off_button.state(["disabled"] if not heating_enabled else ["!disabled"])
+        if record:
+            self._append_history(temperature, target, on_threshold, off_threshold, heater_relay_on)
         self._draw_graph()
 
     def _tick(self):
         try:
             self.poll()
         except Exception as exc:
-            self.status_var.set(f"Ошибка: {exc}")
-        self.root.after(1000, self._tick)
+            self._mark_unavailable(f"Ошибка: {exc}")
+        if not self.connected:
+            self._draw_graph()
+        self._poll_job = self.root.after(1000, self._tick)
 
 
 if __name__ == "__main__":
