@@ -31,7 +31,10 @@ REG_OFF_THRESHOLD_X10 = 18
 REG_OFF_LOOKAHEAD_X10 = 19
 REG_ON_LOOKAHEAD_X10 = 20
 REG_LEARNED_CYCLES = 21
-REGISTER_COUNT = 22
+REG_CLOSING_HEIGHT_MM = 22
+REG_CLOSING_TIME_X10 = 23
+REG_NEXT_MOTOR_COMMAND = 24
+REGISTER_COUNT = 25
 
 CMD_HEAT_ON = 1
 CMD_HEAT_OFF = 2
@@ -39,7 +42,6 @@ CMD_CLEAR_FAULT = 5
 CMD_SAVE_THERMOSTAT = 6
 CMD_MOTOR_OPEN = 7
 CMD_MOTOR_CLOSE = 8
-CMD_MOTOR_STOP = 9
 NOISE_FILTER_ALPHA = 0.12
 HISTORY_SECONDS = 3600
 MAX_SAMPLE_GAP_SECONDS = 3.0
@@ -109,6 +111,7 @@ class App:
         self.min_on_var = tk.StringVar(value="10")
         self.min_off_var = tk.StringVar(value="10")
         self.emergency_var = tk.StringVar(value="300.0")
+        self.closing_height_var = tk.StringVar(value="60")
         self.anticipation_var = tk.BooleanVar(value=False)
 
         self.status_var = tk.StringVar(value="Не подключено")
@@ -122,11 +125,11 @@ class App:
         self.min_on_entry = None
         self.min_off_entry = None
         self.emergency_entry = None
+        self.closing_height_entry = None
         self.heat_on_button = None
         self.heat_off_button = None
         self.motor_open_button = None
         self.motor_close_button = None
-        self.motor_stop_button = None
 
         self.history = deque(maxlen=7200)
         self._filtered_temperature = None
@@ -139,6 +142,7 @@ class App:
             "min_on": (self.min_on_var, self.min_on_entry),
             "min_off": (self.min_off_var, self.min_off_entry),
             "emergency": (self.emergency_var, self.emergency_entry),
+            "closing_height": (self.closing_height_var, self.closing_height_entry),
         }
         for name, (variable, _) in self._settings_fields.items():
             variable.trace_add("write", lambda *_args, key=name: self._mark_edited(key))
@@ -188,6 +192,9 @@ class App:
         self.emergency_entry = ttk.Entry(ctrl, textvariable=self.emergency_var, width=10)
         self.emergency_entry.grid(row=2, column=1, sticky="w")
         ttk.Button(ctrl, text="Записать термостат", command=self.write_thermostat).grid(row=2, column=2, columnspan=2, padx=6)
+        ttk.Label(ctrl, text="Высота закрытия, мм:").grid(row=2, column=4, sticky="w")
+        self.closing_height_entry = ttk.Entry(ctrl, textvariable=self.closing_height_var, width=10)
+        self.closing_height_entry.grid(row=2, column=5, sticky="w")
         self.anticipation_check = ttk.Checkbutton(
             ctrl, text="Упреждение и автоподстройка",
             variable=self.anticipation_var, command=self.write_anticipation,
@@ -203,8 +210,6 @@ class App:
         self.motor_open_button.grid(row=4, column=0, pady=4)
         self.motor_close_button = ttk.Button(ctrl, text="Закрыть", command=lambda: self.send_command(CMD_MOTOR_CLOSE))
         self.motor_close_button.grid(row=4, column=1, pady=4)
-        self.motor_stop_button = ttk.Button(ctrl, text="Стоп мотор", command=lambda: self.send_command(CMD_MOTOR_STOP))
-        self.motor_stop_button.grid(row=4, column=2, pady=4)
 
         stat = ttk.LabelFrame(frm, text="Статус", padding=8)
         stat.grid(row=2, column=0, sticky="ew", pady=(8, 0))
@@ -294,9 +299,8 @@ class App:
             self.motor_close_button, self.anticipation_check,
         ):
             widget.state(["disabled"])
-        # Keep manual OFF/STOP available during a failed status read.
-        for widget in (self.heat_off_button, self.motor_stop_button):
-            widget.state(["!disabled"] if self.connected else ["disabled"])
+        # Keep heater OFF available during a failed status read.
+        self.heat_off_button.state(["!disabled"] if self.connected else ["disabled"])
 
     def _mark_unavailable(self, reason, record=True):
         self.status_var.set(reason)
@@ -340,6 +344,8 @@ class App:
         return fn(*args, **kwargs)
 
     def write_reg(self, addr: int, value: int):
+        if addr == REG_COMMAND and (int(value) & 0xFFFF) == 9:
+            raise ValueError("Ручная остановка привода запрещена")
         if not self.connected or not self.client:
             raise RuntimeError("Нет подключения")
         rr = self._call_with_slave(self.client.write_register, addr, int(value) & 0xFFFF)
@@ -379,12 +385,15 @@ class App:
             min_on = int(self.min_on_var.get())
             min_off = int(self.min_off_var.get())
             emergency = float(self.emergency_var.get().replace(",", "."))
+            closing_height = int(self.closing_height_var.get())
             if not math.isfinite(hysteresis) or not 0.5 <= hysteresis <= 50:
                 raise ValueError("Гистерезис должен быть в пределах 0,5...50 °C")
             if not 0 <= min_on <= 3600 or not 0 <= min_off <= 3600:
                 raise ValueError("Минимальное время ON/OFF должно быть в пределах 0...3600 с")
             if not math.isfinite(emergency) or not 10 <= emergency <= 300:
                 raise ValueError("Аварийная температура должна быть в пределах 10...300 °C")
+            if not 13 <= closing_height <= 180:
+                raise ValueError("Высота закрытия должна быть в пределах 13...180 мм")
             if self._latest_target is None:
                 raise ValueError("Сначала получите актуальное состояние контроллера")
             if emergency < self._latest_target:
@@ -393,8 +402,11 @@ class App:
             self.write_reg(REG_MIN_ON_SECONDS, min_on)
             self.write_reg(REG_MIN_OFF_SECONDS, min_off)
             self.write_reg(REG_EMERGENCY_X10, int(round(emergency * 10.0)))
+            self.write_reg(REG_CLOSING_HEIGHT_MM, closing_height)
             self.write_reg(REG_COMMAND, CMD_SAVE_THERMOSTAT)
-            self._dirty_fields.difference_update(("hysteresis", "min_on", "min_off", "emergency"))
+            self._dirty_fields.difference_update(
+                ("hysteresis", "min_on", "min_off", "emergency", "closing_height")
+            )
             self.poll(record=False)
         except Exception as exc:
             messagebox.showerror("Modbus", str(exc))
@@ -567,7 +579,7 @@ class App:
             raise RuntimeError(f"Ошибка чтения Modbus: {rr}")
         r = rr.registers
         if len(r) < REGISTER_COUNT:
-            raise RuntimeError("Нужны регистры 0...21. Обновите прошивку контроллера")
+            raise RuntimeError("Нужны регистры 0...24. Обновите прошивку контроллера")
 
         status = r[REG_STATUS_BITS]
         temp_raw = r[REG_TEMPERATURE_X10]
@@ -584,13 +596,16 @@ class App:
         motor_open_remaining = r[REG_MOTOR_OPEN_REMAINING_SEC]
         heating_enabled = bool(status & (1 << 0))
         heater_relay_on = bool(status & (1 << 1))
-        lid_closed = bool(status & (1 << 5))
+        di6_active = bool(status & (1 << 5))
         anticipation_enabled = bool(r[REG_ANTICIPATION_ENABLE])
         rate = self._to_i16(r[REG_RATE_C_MIN_X100]) / 100.0
         on_threshold = self._to_i16(r[REG_ON_THRESHOLD_X10]) / 10.0
         off_threshold = self._to_i16(r[REG_OFF_THRESHOLD_X10]) / 10.0
         off_seconds, on_seconds = r[REG_OFF_LOOKAHEAD_X10] / 10.0, r[REG_ON_LOOKAHEAD_X10] / 10.0
         learned = r[REG_LEARNED_CYCLES]
+        closing_height = r[REG_CLOSING_HEIGHT_MM]
+        closing_time = r[REG_CLOSING_TIME_X10] / 10.0
+        next_motor_command = r[REG_NEXT_MOTOR_COMMAND]
         fault = sensor_fault or bool(status & (1 << 3)) or fault_code != 0
         self._latest_target = target
         self._last_anticipation = anticipation_enabled
@@ -607,7 +622,10 @@ class App:
         lines = [
             f"Температура: {temp_text} °C   Уставка: {target:.1f} °C   Гистерезис: {hysteresis:.1f} °C   AD8495: {r[REG_SENSOR_MV]} мВ",
             f"Мин. ON/OFF: {min_on}/{min_off} с   Авария: {emergency:.1f} °C   "
+            f"Высота закрытия: {closing_height} мм   Время закрытия: {closing_time:.2f} с",
             f"Мотор: {MOTOR_DIRECTION_TEXT.get(motor_direction, str(motor_direction))}, открытие осталось {motor_open_remaining} с",
+            f"DI6 аварийный концевик: {'СРАБОТАЛ' if di6_active else 'норма'}",
+            f"Следующая команда: {'Открыть' if next_motor_command == 1 else 'Закрыть' if next_motor_command == 2 else 'неизвестно'}",
             f"StatusBits=0x{status:04X} [{self._decode_status_bits(status)}]",
             f"CmdResult={cmd_res} ({CMD_RESULT_TEXT.get(cmd_res, 'Неизвестный результат')})   "
             f"Fault={fault_code} ({FAULT_TEXT.get(fault_code, 'Неизвестная авария')})",
@@ -635,10 +653,14 @@ class App:
         self._sync_settings({
             "target": f"{target:.1f}", "hysteresis": f"{hysteresis:.1f}",
             "min_on": str(min_on), "min_off": str(min_off), "emergency": f"{emergency:.1f}",
+            "closing_height": str(closing_height),
         })
-        self.motor_open_button.state(["disabled"] if motor_direction == 1 or motor_open_remaining == 0 else ["!disabled"])
-        self.motor_close_button.state(["disabled"] if motor_direction == 2 or lid_closed else ["!disabled"])
-        self.motor_stop_button.state(["disabled"] if motor_direction == 0 else ["!disabled"])
+        self.motor_open_button.state(
+            ["disabled"] if motor_direction == 1 or (not di6_active and next_motor_command != 1) else ["!disabled"]
+        )
+        self.motor_close_button.state(
+            ["disabled"] if di6_active or motor_direction == 2 or next_motor_command != 2 else ["!disabled"]
+        )
         self.heat_on_button.state(["disabled"] if heating_enabled else ["!disabled"])
         self.heat_off_button.state(["disabled"] if not heating_enabled else ["!disabled"])
         if record:

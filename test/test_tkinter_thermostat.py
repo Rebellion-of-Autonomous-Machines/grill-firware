@@ -22,7 +22,7 @@ class FakeClient:
     def __init__(self):
         self.registers = [
             3, 994, 1000, 20, 10, 10, 3000, 0, 0, 7, 0, 1, 1287, 0, 15,
-            1, (-125) & 0xFFFF, 990, 975, 300, 150, 4,
+            1, (-125) & 0xFFFF, 990, 975, 300, 150, 4, 60, 13, 2,
         ]
         self.writes = []
         self.reads = []
@@ -71,7 +71,7 @@ class AppTest(unittest.TestCase):
 
     def test_register_decoding_and_status(self):
         self.app.poll()
-        self.assertEqual(self.client.reads, [(0, 22, 1)])
+        self.assertEqual(self.client.reads, [(0, 25, 1)])
         self.assertEqual(len(self.app.history), 1)
         sample = self.app.history[-1]
         self.assertEqual(sample.temperature, 99.4)
@@ -80,6 +80,7 @@ class AppTest(unittest.TestCase):
         self.assertEqual(sample.off_threshold, 97.5)
         self.assertTrue(sample.contactor)
         self.assertTrue(self.app.anticipation_var.get())
+        self.assertEqual(self.app.closing_height_var.get(), "60")
         self.assertFalse(self.app.anticipation_check.instate(["disabled"]))
         self.assertIn("-1.25", self.app.anticipation_status_var.get())
         self.assertIn("4", self.app.learning_var.get())
@@ -129,6 +130,7 @@ class AppTest(unittest.TestCase):
         self.app.target_var.set("110,5")
         self.app.hysteresis_var.set("3,0")
         self.app.min_on_var.set("15")
+        self.app.closing_height_var.set("70")
         self.app.poll(record=False)
         self.assertEqual(self.app.target_var.get(), "110,5")
         self.assertEqual(self.app.hysteresis_var.get(), "3,0")
@@ -138,6 +140,7 @@ class AppTest(unittest.TestCase):
         self.assertEqual(self.app.hysteresis_var.get(), "3,0")
         self.app.write_thermostat()
         self.assertEqual(self.client.registers[3:5], [30, 15])
+        self.assertEqual(self.client.registers[22], 70)
         self.assertFalse(self.app._dirty_fields)
         self.messages.assert_not_called()
 
@@ -183,7 +186,7 @@ class AppTest(unittest.TestCase):
 
     def test_bad_packet_is_reported(self):
         self.client.registers = self.client.registers[:16]
-        with self.assertRaisesRegex(RuntimeError, "0...21"):
+        with self.assertRaisesRegex(RuntimeError, "0...24"):
             self.app.poll()
 
     def test_hour_uses_elapsed_time_not_number_of_points(self):
@@ -224,13 +227,24 @@ class AppTest(unittest.TestCase):
         self.client.registers[13] = 2
         self.app.poll()
         self.assertTrue(self.app.motor_close_button.instate(["disabled"]))
-        self.assertFalse(self.app.motor_stop_button.instate(["disabled"]))
+        self.assertIn("DI6 аварийный концевик: СРАБОТАЛ", self.app.values_var.get())
+        self.assertFalse(hasattr(self.app, "motor_stop_button"))
         self.assertIn("движение крышки", self.app.learning_var.get())
         self.client.registers[13] = 0
         self.client.registers[14] = 0
+        self.client.registers[24] = 2
         self.app.poll()
-        self.assertTrue(self.app.motor_open_button.instate(["disabled"]))
-        self.assertTrue(self.app.motor_stop_button.instate(["disabled"]))
+        self.assertFalse(self.app.motor_open_button.instate(["disabled"]))
+        self.assertTrue(self.app.motor_close_button.instate(["disabled"]))
+        self.assertFalse(hasattr(self.app, "motor_stop_button"))
+
+    def test_motor_stop_is_not_sent_even_by_direct_call(self):
+        self.app.send_command(9)
+        self.messages.assert_called_once()
+        self.assertFalse(self.client.writes)
+        with self.assertRaisesRegex(ValueError, "остановка"):
+            self.app.write_reg(ui.REG_COMMAND, 9)
+        self.assertFalse(self.client.writes)
 
     def test_full_hour_contactor_history_merges_to_two_intervals(self):
         for timestamp in range(6400, 10001):
@@ -242,11 +256,11 @@ class AppTest(unittest.TestCase):
     def test_minimum_window_keeps_graph_visible(self):
         self.app.poll()
         self.root.attributes("-alpha", 0.0)
-        self.root.geometry("1000x660")
+        self.root.geometry("1000x720")
         self.root.deiconify()
         self.root.update_idletasks()
         canvas = self.app.graph_canvas
-        self.assertGreaterEqual(canvas.winfo_height(), 120)
+        self.assertGreaterEqual(canvas.winfo_height(), 110)
         bottom = canvas.winfo_rooty() - self.root.winfo_rooty() + canvas.winfo_height()
         self.assertLessEqual(bottom, self.root.winfo_height())
         self.root.withdraw()

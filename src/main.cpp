@@ -26,7 +26,10 @@ static const uint8_t DI6_BIT = 5;                  // P5 on input PCF8574.
 static const bool DI6_ACTIVE_LOW = true;
 static const uint16_t RELAY_DEADTIME_MS = 120;
 static const bool STOP_USE_NO_STATE = false;       // false = NC/NC stop, true = NO/NO stop.
-static const uint32_t OPEN_TRAVEL_MS = 15000;
+static const uint32_t OPEN_TRAVEL_MS = 6000;
+static const uint16_t DEFAULT_CLOSING_HEIGHT_MM = 60;
+static const uint16_t MIN_CLOSING_HEIGHT_MM = 13;
+static const uint16_t MAX_CLOSING_HEIGHT_MM = 180;
 
 uint8_t relayOutputMask = 0xFF;
 
@@ -88,6 +91,9 @@ enum ModbusReg : uint16_t {
   REG_OFF_LOOKAHEAD_X10 = 19, // RO seconds x10
   REG_ON_LOOKAHEAD_X10 = 20,  // RO seconds x10
   REG_LEARNED_CYCLES = 21,    // RO completed extrema
+  REG_CLOSING_HEIGHT_MM = 22,  // RW target lid height
+  REG_CLOSING_TIME_X10 = 23,  // RO calculated closing time, seconds x10
+  REG_NEXT_MOTOR_COMMAND = 24, // RO 1=open, 2=close
   REG_REG_COUNT = 32
 };
 
@@ -99,7 +105,7 @@ enum ModbusCommand : uint16_t {
   CMD_SAVE_THERMOSTAT = 6,
   CMD_MOTOR_OPEN = 7,
   CMD_MOTOR_CLOSE = 8,
-  CMD_MOTOR_STOP = 9
+  CMD_MOTOR_STOP_RESERVED = 9 // Retired command; must never stop the motor.
 };
 
 enum ModbusCommandResult : uint16_t {
@@ -123,6 +129,7 @@ bool faultActive = false;
 String faultText = "";
 uint32_t lastSensorReadMs = 0;
 bool di6Active = false;
+bool di6WasActive = false;
 
 enum MotorDirection : uint8_t {
   MOTOR_STOP = 0,
@@ -133,6 +140,9 @@ enum MotorDirection : uint8_t {
 MotorDirection currentDirection = MOTOR_STOP;
 uint32_t motorRunStartMs = 0;
 uint32_t openRemainingMs = OPEN_TRAVEL_MS;
+uint32_t closeRunDurationMs = 0;
+bool nextMotorCommandIsOpen = true;
+bool startupOpeningInProgress = true;
 float targetTemperatureC = ThermostatDefaults::targetC;
 float thermostatHysteresisC = ThermostatDefaults::hysteresisC;
 uint16_t thermostatMinOnSeconds = ThermostatDefaults::minOnSeconds;
@@ -140,6 +150,7 @@ uint16_t thermostatMinOffSeconds = ThermostatDefaults::minOffSeconds;
 bool anticipationEnabled = true;
 ThermostatAnticipation anticipation;
 float emergencyTemperatureC = 300.0f;
+uint16_t closingHeightMm = DEFAULT_CLOSING_HEIGHT_MM;
 uint32_t contactorLastChangeMs = 0;
 
 static const uint32_t SENSOR_READ_INTERVAL_MS = 500;
@@ -250,13 +261,16 @@ void loadThermostatSettings() {
     saveThermostatSettings();
     return;
   }
-  bool migrateDefaults = preferences.getUChar("version", 1) < 2;
+  uint8_t storedVersion = preferences.getUChar("version", 1);
+  bool migrateDefaults = storedVersion < 2;
+  bool migrateClosingHeight = storedVersion < 3;
   targetTemperatureC = preferences.getFloat("target", targetTemperatureC);
   thermostatHysteresisC = preferences.getFloat("hyst", thermostatHysteresisC);
   thermostatMinOnSeconds = preferences.getUShort("min_on", thermostatMinOnSeconds);
   thermostatMinOffSeconds = preferences.getUShort("min_off", thermostatMinOffSeconds);
   emergencyTemperatureC = preferences.getFloat("emergency", emergencyTemperatureC);
   anticipationEnabled = preferences.getBool("anticipation", true);
+  closingHeightMm = preferences.getUShort("close_height", DEFAULT_CLOSING_HEIGHT_MM);
   preferences.end();
 
   // Migrate only the previous factory hysteresis; preserve custom settings.
@@ -271,7 +285,9 @@ void loadThermostatSettings() {
   thermostatMinOnSeconds = min(thermostatMinOnSeconds, MAX_MIN_SWITCH_SECONDS);
   thermostatMinOffSeconds = min(thermostatMinOffSeconds, MAX_MIN_SWITCH_SECONDS);
   emergencyTemperatureC = clampFloat(emergencyTemperatureC, targetTemperatureC, SENSOR_MAX_C);
-  if (migrateDefaults) saveThermostatSettings();
+  closingHeightMm = static_cast<uint16_t>(
+      clampFloat(closingHeightMm, MIN_CLOSING_HEIGHT_MM, MAX_CLOSING_HEIGHT_MM));
+  if (migrateDefaults || migrateClosingHeight) saveThermostatSettings();
 }
 
 void saveThermostatSettings() {
@@ -282,7 +298,8 @@ void saveThermostatSettings() {
   preferences.putUShort("min_off", thermostatMinOffSeconds);
   preferences.putFloat("emergency", emergencyTemperatureC);
   preferences.putBool("anticipation", anticipationEnabled);
-  preferences.putUChar("version", 2);
+  preferences.putUShort("close_height", closingHeightMm);
+  preferences.putUChar("version", 3);
   preferences.end();
 }
 
@@ -337,6 +354,7 @@ void setAllRelaysOff() {
   heaterContactorOn = false;
   currentDirection = MOTOR_STOP;
   motorRunStartMs = 0;
+  closeRunDurationMs = 0;
 }
 
 void setHeaterContactor(bool enabled) {
@@ -377,16 +395,88 @@ void stopMotor() {
   stopMotorRaw();
 }
 
-void startOpenMotor() {
-  if (currentDirection == MOTOR_OPEN || openRemainingMs == 0) {
+void startOpenMotor(bool forceRestart = false) {
+  if (currentDirection == MOTOR_OPEN && !forceRestart) {
     return;
   }
 
+  // Every OPEN command is a complete fixed-duration opening cycle.
   stopMotor();
   delay(RELAY_DEADTIME_MS);
+  openRemainingMs = OPEN_TRAVEL_MS;
   setMotorRelaysRaw(true, false);
   currentDirection = MOTOR_OPEN;
   motorRunStartMs = millis();
+  nextMotorCommandIsOpen = false;
+}
+
+void processDI6Emergency() {
+  if (!di6Active) {
+    di6WasActive = false;
+    return;
+  }
+
+  // React once per DI6 activation. A forced restart also gives a full
+  // opening interval if the emergency input appears while already opening.
+  if (!di6WasActive && !startupOpeningInProgress) {
+    startOpenMotor(true);
+  }
+  di6WasActive = true;
+}
+
+// Shape-preserving piecewise cubic interpolation of height -> closing time.
+// The 5 mm point would require 2.4 s, so the safety limit starts at 13 mm.
+float closingTimeSecondsForHeight(uint16_t heightMm) {
+  static const float heights[] = {13, 20, 30, 40, 55, 70, 85, 100, 115, 143, 160, 180};
+  static const float times[] = {2.2f, 2.0f, 1.8f, 1.6f, 1.4f, 1.2f,
+                                1.0f, 0.8f, 0.6f, 0.4f, 0.2f, 0.0f};
+  static const uint8_t count = sizeof(heights) / sizeof(heights[0]);
+  float x = clampFloat(heightMm, MIN_CLOSING_HEIGHT_MM, MAX_CLOSING_HEIGHT_MM);
+  uint8_t segment = count - 2;
+  for (uint8_t i = 0; i + 1 < count; i++) {
+    if (x <= heights[i + 1]) {
+      segment = i;
+      break;
+    }
+  }
+
+  float slope[count];
+  float delta[count - 1];
+  float span[count - 1];
+  for (uint8_t i = 0; i + 1 < count; i++) {
+    span[i] = heights[i + 1] - heights[i];
+    delta[i] = (times[i + 1] - times[i]) / span[i];
+  }
+  slope[0] = delta[0];
+  slope[count - 1] = delta[count - 2];
+  for (uint8_t i = 1; i + 1 < count; i++) {
+    if (delta[i - 1] * delta[i] <= 0.0f) {
+      slope[i] = 0.0f;
+    } else {
+      float previousSpan = span[i - 1];
+      float currentSpan = span[i];
+      float w1 = 2.0f * currentSpan + previousSpan;
+      float w2 = currentSpan + 2.0f * previousSpan;
+      slope[i] = (w1 + w2) / (w1 / delta[i - 1] + w2 / delta[i]);
+    }
+  }
+
+  float u = (x - heights[segment]) / span[segment];
+  float u2 = u * u;
+  float u3 = u2 * u;
+  float h00 = 2.0f * u3 - 3.0f * u2 + 1.0f;
+  float h10 = u3 - 2.0f * u2 + u;
+  float h01 = -2.0f * u3 + 3.0f * u2;
+  float h11 = u3 - u2;
+  float result = h00 * times[segment] +
+                 h10 * span[segment] * slope[segment] +
+                 h01 * times[segment + 1] +
+                 h11 * span[segment] * slope[segment + 1];
+  return clampFloat(result, 0.0f, 2.2f);
+}
+
+uint32_t closingTimeMsForHeight(uint16_t heightMm) {
+  return static_cast<uint32_t>(lroundf(closingTimeSecondsForHeight(heightMm) * 1000.0f));
 }
 
 void startCloseMotor() {
@@ -397,8 +487,9 @@ void startCloseMotor() {
   stopMotor();
   delay(RELAY_DEADTIME_MS);
 
-  if (di6Active) {
-    openRemainingMs = OPEN_TRAVEL_MS;
+  nextMotorCommandIsOpen = true;
+  closeRunDurationMs = closingTimeMsForHeight(closingHeightMm);
+  if (closeRunDurationMs == 0) {
     stopMotorRaw();
     return;
   }
@@ -426,7 +517,8 @@ void updateMotorControl() {
     return;
   }
 
-  if (currentDirection == MOTOR_CLOSE && di6Active) {
+  if (currentDirection == MOTOR_CLOSE && motorRunStartMs != 0 &&
+      (millis() - motorRunStartMs) >= closeRunDurationMs) {
     completeCloseMotor();
   }
 }
@@ -484,6 +576,14 @@ void setTargetTemperature(float targetC) {
   if (fabsf(targetC - targetTemperatureC) > 0.01f) anticipation.reset();
   targetTemperatureC = clampFloat(targetC, MIN_TARGET_C, MAX_TARGET_C);
   modbusRegs[REG_TARGET_X10] = floatToI16Reg(targetTemperatureC, 10.0f);
+}
+
+void setClosingHeight(uint16_t heightMm) {
+  closingHeightMm = static_cast<uint16_t>(
+      clampFloat(heightMm, MIN_CLOSING_HEIGHT_MM, MAX_CLOSING_HEIGHT_MM));
+  modbusRegs[REG_CLOSING_HEIGHT_MM] = closingHeightMm;
+  modbusRegs[REG_CLOSING_TIME_X10] =
+      floatToU16(closingTimeSecondsForHeight(closingHeightMm), 10.0f);
 }
 
 float clampFloat(float value, float low, float high) {
@@ -595,7 +695,10 @@ String statusJson() {
   json += ",\"di6_active\":" + boolToJson(di6Active);
   json += ",\"motor_direction\":" + String((uint8_t)currentDirection);
   json += ",\"motor_direction_text\":\"" + String(motorDirectionText()) + "\"";
+  json += ",\"next_motor_command\":" + String(nextMotorCommandIsOpen ? 1 : 2);
   json += ",\"motor_open_remaining_sec\":" + String(openRemainingSeconds());
+  json += ",\"closing_height_mm\":" + String(closingHeightMm);
+  json += ",\"closing_time_seconds\":" + String(closingTimeSecondsForHeight(closingHeightMm), 2);
   json += "}";
   return json;
 }
@@ -647,6 +750,9 @@ void syncModbusRegistersFromState() {
   modbusRegs[REG_OFF_LOOKAHEAD_X10] = floatToU16(anticipation.offSeconds(), 10.0f);
   modbusRegs[REG_ON_LOOKAHEAD_X10] = floatToU16(anticipation.onSeconds(), 10.0f);
   modbusRegs[REG_LEARNED_CYCLES] = anticipation.learnedCycles();
+  modbusRegs[REG_CLOSING_HEIGHT_MM] = closingHeightMm;
+  modbusRegs[REG_CLOSING_TIME_X10] = floatToU16(closingTimeSecondsForHeight(closingHeightMm), 10.0f);
+  modbusRegs[REG_NEXT_MOTOR_COMMAND] = nextMotorCommandIsOpen ? 1 : 2;
 }
 
 void executeModbusCommand(uint16_t cmd) {
@@ -670,13 +776,21 @@ void executeModbusCommand(uint16_t cmd) {
       saveThermostatSettings();
       break;
     case CMD_MOTOR_OPEN:
-      startOpenMotor();
+      if (!di6Active && !nextMotorCommandIsOpen) {
+        commandResult = CMD_RES_BUSY;
+        break;
+      }
+      startOpenMotor(di6Active);
       break;
     case CMD_MOTOR_CLOSE:
+      if (di6Active || nextMotorCommandIsOpen) {
+        commandResult = CMD_RES_BUSY;
+        break;
+      }
       startCloseMotor();
       break;
-    case CMD_MOTOR_STOP:
-      stopMotor();
+    case CMD_MOTOR_STOP_RESERVED:
+      commandResult = CMD_RES_UNKNOWN_CMD;
       break;
     default:
       commandResult = CMD_RES_UNKNOWN_CMD;
@@ -687,6 +801,11 @@ void executeModbusCommand(uint16_t cmd) {
 
 bool writeModbusRegister(uint16_t address, uint16_t value) {
   if (address >= REG_REG_COUNT) return false;
+  if (startupOpeningInProgress) {
+    commandResult = CMD_RES_BUSY;
+    syncModbusRegistersFromState();
+    return false;
+  }
   commandResult = CMD_RES_OK;
 
   switch (address) {
@@ -715,6 +834,10 @@ bool writeModbusRegister(uint16_t address, uint16_t value) {
       break;
     case REG_EMERGENCY_X10:
       emergencyTemperatureC = clampFloat(value / 10.0f, targetTemperatureC, SENSOR_MAX_C);
+      saveThermostatSettings();
+      break;
+    case REG_CLOSING_HEIGHT_MM:
+      setClosingHeight(value);
       saveThermostatSettings();
       break;
     case REG_HEATING_ENABLE:
@@ -818,6 +941,9 @@ void processModbusTcpRequest(EthernetClient& client) {
 }
 
 void handleModbusTcp() {
+  if (startupOpeningInProgress) {
+    return;
+  }
   if (!modbusClient || !modbusClient.connected()) {
     EthernetClient newClient = modbusServer.available();
     if (newClient) modbusClient = newClient;
@@ -994,7 +1120,15 @@ String generateHTML() {
         <label for="emergencyInput">Аварийная температура, °C</label>
         <input id="emergencyInput" name="emergency" type="number" step="0.5" min="10" max="300" value=")rawliteral";
 
-  html += String(emergencyTemperatureC, 1);
+      html += String(emergencyTemperatureC, 1);
+
+  html += R"rawliteral(">
+      </div>
+      <div class="field">
+        <label for="closingHeightInput">Высота закрытия, мм</label>
+        <input id="closingHeightInput" name="closing_height" type="number" step="1" min="13" max="180" value=")rawliteral";
+
+  html += String(closingHeightMm);
 
   html += R"rawliteral(">
       </div>
@@ -1027,9 +1161,6 @@ String generateHTML() {
       <form action="/motor/close" method="get">
         <button id="motorCloseButton" type="submit">Закрыть</button>
       </form>
-      <form action="/motor/stop" method="get">
-        <button id="motorStopButton" class="stop" type="submit">Стоп мотор</button>
-      </form>
     </div>
     <div class="status">
       <span>Контактор ТЭНа: <b id="heater">)rawliteral";
@@ -1046,10 +1177,15 @@ String generateHTML() {
 
   html += String(contactorLockSeconds(millis()));
 
-  html += R"rawliteral(</b> с</span>
+      html += R"rawliteral(</b> с</span>
       <span>Мотор: <b id="motorDirection">)rawliteral";
 
   html += motorDirectionText();
+
+  html += R"rawliteral(</b></span>
+      <span>DI6 аварийный концевик: <b id="di6State">)rawliteral";
+
+  html += di6Active ? "СРАБОТАЛ" : "норма";
 
   html += R"rawliteral(</b></span>
     </div>
@@ -1076,6 +1212,16 @@ String generateHTML() {
   html += R"rawliteral(</b> °C</span>
       <span>AD8495: <b id="ad8495Mv">0.0</b> mV</span>
       <span>Открытие осталось: <b id="motorOpenRemaining">0</b> с</span>
+      <span>Высота закрытия: <b id="closingHeight">)rawliteral";
+
+  html += String(closingHeightMm);
+
+  html += R"rawliteral(</b> мм</span>
+      <span>Время закрытия: <b id="closingTime">)rawliteral";
+
+  html += String(closingTimeSecondsForHeight(closingHeightMm), 2);
+
+  html += R"rawliteral(</b> с</span>
     </div>
     <div class="status">
       <span>Расчетный порог включения: <b id="onThreshold">-</b> °C</span>
@@ -1150,6 +1296,7 @@ String generateHTML() {
         minOnInput: data.min_on_seconds,
         minOffInput: data.min_off_seconds,
         emergencyInput: data.emergency_temperature.toFixed(1),
+        closingHeightInput: data.closing_height_mm,
         anticipationInput: data.anticipation_enabled ? '1' : '0'
       };
       Object.entries(fields).forEach(function ([id, value]) {
@@ -1168,14 +1315,18 @@ String generateHTML() {
       document.getElementById('heater').textContent = data.heater_on ? 'вкл' : 'выкл';
       document.getElementById('enabled').textContent = data.heating_enabled ? 'включен' : 'выключен';
       document.getElementById('motorDirection').textContent = data.motor_direction_text || 'Стоп';
+      const di6State = document.getElementById('di6State');
+      di6State.textContent = data.di6_active ? 'СРАБОТАЛ' : 'норма';
+      di6State.style.color = data.di6_active ? 'var(--warn)' : 'var(--accent)';
       document.getElementById('ad8495Mv').textContent = data.ad8495_mv == null ? 'N/A' : Number(data.ad8495_mv).toFixed(1);
       document.getElementById('motorOpenRemaining').textContent = (data.motor_open_remaining_sec ?? 0).toString();
+      document.getElementById('closingHeight').textContent = data.closing_height_mm;
+      document.getElementById('closingTime').textContent = data.closing_time_seconds.toFixed(2);
       document.getElementById('fault').textContent = data.fault ? data.fault_text : '';
       document.getElementById('heatOnButton').disabled = data.heating_enabled;
       document.getElementById('heatOffButton').disabled = !data.heating_enabled;
-      document.getElementById('motorOpenButton').disabled = data.motor_direction === 1 || (data.motor_open_remaining_sec ?? 0) === 0;
-      document.getElementById('motorCloseButton').disabled = data.motor_direction === 2 || data.di6_active;
-      document.getElementById('motorStopButton').disabled = data.motor_direction === 0;
+      document.getElementById('motorOpenButton').disabled = data.motor_direction === 1 || (!data.di6_active && data.next_motor_command !== 1);
+      document.getElementById('motorCloseButton').disabled = data.di6_active || data.motor_direction === 2 || data.next_motor_command !== 2;
     }
 
     document.querySelectorAll('form:not(#networkForm)').forEach(function (form) {
@@ -1235,9 +1386,19 @@ void sendActionDone() {
   server.send(302, "text/plain", "");
 }
 
+bool rejectControlDuringStartup() {
+  if (!startupOpeningInProgress) {
+    return false;
+  }
+  server.send(423, "text/plain; charset=UTF-8", "Идет обязательное открытие после запуска");
+  return true;
+}
+
 void handleSetThermostat() {
+  if (rejectControlDuringStartup()) return;
   if (!server.hasArg("target") || !server.hasArg("hysteresis") ||
-      !server.hasArg("min_on") || !server.hasArg("min_off") || !server.hasArg("emergency")) {
+      !server.hasArg("min_on") || !server.hasArg("min_off") ||
+      !server.hasArg("emergency") || !server.hasArg("closing_height")) {
     server.send(400, "text/plain; charset=UTF-8", "Не все параметры переданы");
     return;
   }
@@ -1247,6 +1408,7 @@ void handleSetThermostat() {
   long requestedMinOn = server.arg("min_on").toInt();
   long requestedMinOff = server.arg("min_off").toInt();
   float requestedEmergency = server.arg("emergency").toFloat();
+  long requestedClosingHeight = server.arg("closing_height").toInt();
   bool requestedAnticipation = anticipationEnabled;
   if (server.hasArg("anticipation")) {
     if (server.arg("anticipation") != "0" && server.arg("anticipation") != "1") {
@@ -1266,7 +1428,9 @@ void handleSetThermostat() {
   if (requestedHysteresis < MIN_HYSTERESIS_C || requestedHysteresis > MAX_HYSTERESIS_C ||
       requestedMinOn < 0 || requestedMinOn > MAX_MIN_SWITCH_SECONDS ||
       requestedMinOff < 0 || requestedMinOff > MAX_MIN_SWITCH_SECONDS ||
-      requestedEmergency < requestedTarget || requestedEmergency > SENSOR_MAX_C) {
+      requestedEmergency < requestedTarget || requestedEmergency > SENSOR_MAX_C ||
+      requestedClosingHeight < MIN_CLOSING_HEIGHT_MM ||
+      requestedClosingHeight > MAX_CLOSING_HEIGHT_MM) {
     server.send(400, "text/plain; charset=UTF-8", "Параметры термостата вне диапазона");
     return;
   }
@@ -1276,6 +1440,7 @@ void handleSetThermostat() {
   thermostatMinOnSeconds = static_cast<uint16_t>(requestedMinOn);
   thermostatMinOffSeconds = static_cast<uint16_t>(requestedMinOff);
   emergencyTemperatureC = requestedEmergency;
+  setClosingHeight(static_cast<uint16_t>(requestedClosingHeight));
   anticipation.cancelCycle();
   if (anticipationEnabled != requestedAnticipation) anticipation.reset();
   anticipationEnabled = requestedAnticipation;
@@ -1285,6 +1450,7 @@ void handleSetThermostat() {
 }
 
 void handleHeatOn() {
+  if (rejectControlDuringStartup()) return;
   faultActive = false;
   faultText = sensorFault ? "Температура AD8495 вне диапазона 10...300 °C" : "";
   setHeatingEnabled(true);
@@ -1292,23 +1458,37 @@ void handleHeatOn() {
 }
 
 void handleHeatOff() {
+  if (rejectControlDuringStartup()) return;
   setHeatingEnabled(false);
   sendActionDone();
 }
 
 void handleMotorOpen() {
-  startOpenMotor();
+  if (rejectControlDuringStartup()) return;
+  if (!di6Active && !nextMotorCommandIsOpen) {
+    server.send(409, "text/plain; charset=UTF-8", "Сначала необходимо закрыть крышку");
+    return;
+  }
+  startOpenMotor(di6Active);
   sendActionDone();
 }
 
 void handleMotorClose() {
+  if (rejectControlDuringStartup()) return;
+  if (di6Active) {
+    server.send(409, "text/plain; charset=UTF-8", "Закрытие запрещено: сработал аварийный DI6");
+    return;
+  }
+  if (nextMotorCommandIsOpen) {
+    server.send(409, "text/plain; charset=UTF-8", "Сначала необходимо открыть крышку");
+    return;
+  }
   startCloseMotor();
   sendActionDone();
 }
 
-void handleMotorStop() {
-  stopMotor();
-  sendActionDone();
+void handleMotorStopDisabled() {
+  server.send(403, "text/plain; charset=UTF-8", "Ручная остановка привода запрещена");
 }
 
 void handleStatus() {
@@ -1316,6 +1496,7 @@ void handleStatus() {
 }
 
 void handleNetworkSettings() {
+  if (rejectControlDuringStartup()) return;
   if (heatingEnabled || currentDirection != MOTOR_STOP) {
     networkSettingsSaved = false;
     networkSettingsMessage = "Настройки сети можно менять только при выключенном нагреве и остановленном моторе.";
@@ -1385,7 +1566,11 @@ void setup() {
   initInputExpander();
   setAllRelaysOff();
   updateDI6State();
+  startupOpeningInProgress = true;
   runStartupOpenCycle();
+  startupOpeningInProgress = false;
+  updateDI6State();
+  di6WasActive = di6Active;
 
   SPI.begin();
   Ethernet.init(W5500_CS_PIN);
@@ -1405,7 +1590,7 @@ void setup() {
   server.on("/heat/off", HTTP_GET, handleHeatOff);
   server.on("/motor/open", HTTP_GET, handleMotorOpen);
   server.on("/motor/close", HTTP_GET, handleMotorClose);
-  server.on("/motor/stop", HTTP_GET, handleMotorStop);
+  server.on("/motor/stop", HTTP_ANY, handleMotorStopDisabled);
   server.on("/api/status", HTTP_GET, handleStatus);
   server.on("/network", HTTP_POST, handleNetworkSettings);
     
@@ -1426,8 +1611,9 @@ void setup() {
 
 void loop() {
   dnsServer.processNextRequest();
-  server.handleClient();
   updateDI6State();
+  processDI6Emergency();
+  server.handleClient();
   updateMotorControl();
   if (ethernetUseDhcp) Ethernet.maintain();
   handleModbusTcp();
@@ -1469,6 +1655,3 @@ void loop() {
   handleModbusTcp();
   server.handleClient();
 }
-
-
-
