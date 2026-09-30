@@ -28,8 +28,9 @@ static const uint16_t RELAY_DEADTIME_MS = 120;
 static const bool STOP_USE_NO_STATE = false;       // false = NC/NC stop, true = NO/NO stop.
 static const uint32_t OPEN_TRAVEL_MS = 6000;
 static const uint16_t DEFAULT_CLOSING_HEIGHT_MM = 60;
-static const uint16_t MIN_CLOSING_HEIGHT_MM = 13;
+static const uint16_t MIN_CLOSING_HEIGHT_MM = 0;
 static const uint16_t MAX_CLOSING_HEIGHT_MM = 180;
+static const float MAX_CLOSING_TIME_SECONDS = 2.4f;
 
 uint8_t relayOutputMask = 0xFF;
 
@@ -69,7 +70,7 @@ String networkSettingsMessage;
 bool networkSettingsSaved = false;
 
 enum ModbusReg : uint16_t {
-  REG_STATUS_BITS = 0,        // RO bits: 0 enabled, 1 contactor on, 3 fault, 4 sensor fault, 5 lid closed
+  REG_STATUS_BITS = 0,        // RO bits: 0 enabled, 1 contactor on, 3 fault, 4 sensor fault, 5 DI6 active
   REG_TEMPERATURE_X10 = 1,    // RO int16
   REG_TARGET_X10 = 2,         // RW int16
   REG_HYSTERESIS_X10 = 3,     // RW uint16
@@ -424,55 +425,15 @@ void processDI6Emergency() {
   di6WasActive = true;
 }
 
-// Shape-preserving piecewise cubic interpolation of height -> closing time.
-// The 5 mm point would require 2.4 s, so the safety limit starts at 13 mm.
+// Global cubic least-squares approximation of all height/time table points.
+// Height is normalized to 0...1; the result is clamped to the safe 0...2.4 s.
 float closingTimeSecondsForHeight(uint16_t heightMm) {
-  static const float heights[] = {13, 20, 30, 40, 55, 70, 85, 100, 115, 143, 160, 180};
-  static const float times[] = {2.2f, 2.0f, 1.8f, 1.6f, 1.4f, 1.2f,
-                                1.0f, 0.8f, 0.6f, 0.4f, 0.2f, 0.0f};
-  static const uint8_t count = sizeof(heights) / sizeof(heights[0]);
-  float x = clampFloat(heightMm, MIN_CLOSING_HEIGHT_MM, MAX_CLOSING_HEIGHT_MM);
-  uint8_t segment = count - 2;
-  for (uint8_t i = 0; i + 1 < count; i++) {
-    if (x <= heights[i + 1]) {
-      segment = i;
-      break;
-    }
-  }
-
-  float slope[count];
-  float delta[count - 1];
-  float span[count - 1];
-  for (uint8_t i = 0; i + 1 < count; i++) {
-    span[i] = heights[i + 1] - heights[i];
-    delta[i] = (times[i + 1] - times[i]) / span[i];
-  }
-  slope[0] = delta[0];
-  slope[count - 1] = delta[count - 2];
-  for (uint8_t i = 1; i + 1 < count; i++) {
-    if (delta[i - 1] * delta[i] <= 0.0f) {
-      slope[i] = 0.0f;
-    } else {
-      float previousSpan = span[i - 1];
-      float currentSpan = span[i];
-      float w1 = 2.0f * currentSpan + previousSpan;
-      float w2 = currentSpan + 2.0f * previousSpan;
-      slope[i] = (w1 + w2) / (w1 / delta[i - 1] + w2 / delta[i]);
-    }
-  }
-
-  float u = (x - heights[segment]) / span[segment];
-  float u2 = u * u;
-  float u3 = u2 * u;
-  float h00 = 2.0f * u3 - 3.0f * u2 + 1.0f;
-  float h10 = u3 - 2.0f * u2 + u;
-  float h01 = -2.0f * u3 + 3.0f * u2;
-  float h11 = u3 - u2;
-  float result = h00 * times[segment] +
-                 h10 * span[segment] * slope[segment] +
-                 h01 * times[segment + 1] +
-                 h11 * span[segment] * slope[segment + 1];
-  return clampFloat(result, 0.0f, 2.2f);
+  const float x = clampFloat(static_cast<float>(heightMm),
+                             static_cast<float>(MIN_CLOSING_HEIGHT_MM),
+                             static_cast<float>(MAX_CLOSING_HEIGHT_MM)) /
+                  static_cast<float>(MAX_CLOSING_HEIGHT_MM);
+  const float result = ((-1.77988586f * x + 4.01801865f) * x - 4.75104193f) * x + 2.50855197f;
+  return clampFloat(result, 0.0f, MAX_CLOSING_TIME_SECONDS);
 }
 
 uint32_t closingTimeMsForHeight(uint16_t heightMm) {
@@ -1126,7 +1087,7 @@ String generateHTML() {
       </div>
       <div class="field">
         <label for="closingHeightInput">Высота закрытия, мм</label>
-        <input id="closingHeightInput" name="closing_height" type="number" step="1" min="13" max="180" value=")rawliteral";
+        <input id="closingHeightInput" name="closing_height" type="number" step="1" min="0" max="180" value=")rawliteral";
 
   html += String(closingHeightMm);
 

@@ -392,8 +392,8 @@ class App:
                 raise ValueError("Минимальное время ON/OFF должно быть в пределах 0...3600 с")
             if not math.isfinite(emergency) or not 10 <= emergency <= 300:
                 raise ValueError("Аварийная температура должна быть в пределах 10...300 °C")
-            if not 13 <= closing_height <= 180:
-                raise ValueError("Высота закрытия должна быть в пределах 13...180 мм")
+            if not 0 <= closing_height <= 180:
+                raise ValueError("Высота закрытия должна быть в пределах 0...180 мм")
             if self._latest_target is None:
                 raise ValueError("Сначала получите актуальное состояние контроллера")
             if emergency < self._latest_target:

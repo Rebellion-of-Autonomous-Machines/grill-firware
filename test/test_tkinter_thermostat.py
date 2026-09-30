@@ -144,6 +144,13 @@ class AppTest(unittest.TestCase):
         self.assertFalse(self.app._dirty_fields)
         self.messages.assert_not_called()
 
+    def test_zero_closing_height_is_accepted(self):
+        self.app.poll()
+        self.app.closing_height_var.set("0")
+        self.app.write_thermostat()
+        self.assertEqual(self.client.registers[22], 0)
+        self.messages.assert_not_called()
+
     def test_bad_values_never_write(self):
         self.app.poll()
         for value in ("nan", "inf", "-1", "301"):
