@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
-import rs485_tester as ui
+import modbusTCP_tester as ui
 
 
 class Response:
@@ -22,7 +22,7 @@ class FakeClient:
     def __init__(self):
         self.registers = [
             3, 994, 1000, 20, 10, 10, 3000, 0, 0, 7, 0, 1, 1287, 0, 15,
-            1, (-125) & 0xFFFF, 990, 975, 300, 150, 4, 60, 13, 2,
+            1, (-125) & 0xFFFF, 990, 975, 300, 150, 4, 60, 13, 2, 0, 8, 1,
         ]
         self.writes = []
         self.reads = []
@@ -38,14 +38,26 @@ class FakeClient:
         self.reads.append((address, count, device_id))
         if self.fail_read:
             raise TimeoutError("test timeout")
-        return Response(self.registers[address:address + count])
+        assert (address, count) == (17, 1)
+        return Response([2])
+
+    def read_input_registers(self, address, *, count=1, device_id=1):
+        self.reads.append((address, count, device_id))
+        if self.fail_read:
+            raise TimeoutError("test timeout")
+        if address == 0:
+            return Response([0, 7200, 0, 3600])
+        assert (address, count) == (80, 28)
+        return Response(self.registers[:count])
 
     def write_register(self, address, value, *, device_id=1):
         self.writes.append((address, value, device_id))
         if self.fail_write:
             return Response(error=True)
         if not self.ignore_write:
-            self.registers[address] = value
+            index = {7: 2, 8: 22, 9: 11, 10: 3, 11: 4, 12: 5,
+                     13: 6, 14: 15, 15: 7, 0: 7}[address]
+            self.registers[index] = value
         return Response()
 
     def close(self):
@@ -71,7 +83,7 @@ class AppTest(unittest.TestCase):
 
     def test_register_decoding_and_status(self):
         self.app.poll()
-        self.assertEqual(self.client.reads, [(0, 25, 1)])
+        self.assertEqual(self.client.reads, [(17, 1, 1), (80, 28, 1), (0, 4, 1)])
         self.assertEqual(len(self.app.history), 1)
         sample = self.app.history[-1]
         self.assertEqual(sample.temperature, 99.4)
@@ -89,12 +101,12 @@ class AppTest(unittest.TestCase):
     def test_toggle_roundtrip_does_not_add_a_graph_sample(self):
         self.app.poll()
         self.app.anticipation_check.invoke()
-        self.assertEqual(self.client.writes, [(15, 0, 1)])
+        self.assertEqual(self.client.writes, [(14, 0, 1)])
         self.assertFalse(self.app.anticipation_var.get())
         self.assertIn("выключена", self.app.learning_var.get())
         self.assertEqual(len(self.app.history), 1)
         self.app.anticipation_check.invoke()
-        self.assertEqual(self.client.writes[-1], (15, 1, 1))
+        self.assertEqual(self.client.writes[-1], (14, 1, 1))
         self.assertTrue(self.app.anticipation_var.get())
         self.messages.assert_not_called()
 
@@ -151,6 +163,28 @@ class AppTest(unittest.TestCase):
         self.assertEqual(self.client.registers[22], 0)
         self.messages.assert_not_called()
 
+    def test_commands_use_new_wire_addresses(self):
+        self.app.send_command(ui.CMD_MOTOR_CLOSE)
+        self.app.send_command(ui.CMD_MOTOR_OPEN)
+        self.app.set_heating(True)
+        self.app.send_command(ui.CMD_CLEAR_FAULT)
+        self.assertEqual(self.client.writes, [(0, 12, 1), (0, 11, 1), (9, 1, 1), (15, 5, 1)])
+
+    def test_old_protocol_version_is_rejected(self):
+        with patch.object(self.client, "read_holding_registers", return_value=Response([1])):
+            with self.assertRaisesRegex(RuntimeError, "версии 2"):
+                self.app.poll()
+        self.assertFalse(self.client.writes)
+
+    def test_both_motor_buttons_disabled_during_any_motion(self):
+        for direction in (1, 2):
+            for next_command in (1, 2):
+                self.client.registers[13] = direction
+                self.client.registers[24] = next_command
+                self.app.poll(record=False)
+                self.assertTrue(self.app.motor_open_button.instate(["disabled"]))
+                self.assertTrue(self.app.motor_close_button.instate(["disabled"]))
+
     def test_bad_values_never_write(self):
         self.app.poll()
         for value in ("nan", "inf", "-1", "301"):
@@ -193,7 +227,7 @@ class AppTest(unittest.TestCase):
 
     def test_bad_packet_is_reported(self):
         self.client.registers = self.client.registers[:16]
-        with self.assertRaisesRegex(RuntimeError, "0...24"):
+        with self.assertRaisesRegex(RuntimeError, "30081...30108"):
             self.app.poll()
 
     def test_hour_uses_elapsed_time_not_number_of_points(self):
@@ -241,7 +275,7 @@ class AppTest(unittest.TestCase):
         self.client.registers[14] = 0
         self.client.registers[24] = 2
         self.app.poll()
-        self.assertFalse(self.app.motor_open_button.instate(["disabled"]))
+        self.assertTrue(self.app.motor_open_button.instate(["disabled"]))
         self.assertTrue(self.app.motor_close_button.instate(["disabled"]))
         self.assertFalse(hasattr(self.app, "motor_stop_button"))
 

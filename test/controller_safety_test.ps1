@@ -33,6 +33,8 @@ bool relayEnabled = false;
 int relayWrites = 0;
 ThermostatAnticipation anticipation;
 uint32_t millis() { return clockMs; }
+uint64_t totalRuntimeMs = 0, heaterRuntimeMs = 0;
+uint32_t runtimeTickMs = 0;
 void setRelayPin(uint8_t pin, bool enabled) {
   assert(pin == HEATER_CONTACTOR_RELAY_PIN);
   relayEnabled = enabled;
@@ -41,7 +43,7 @@ void setRelayPin(uint8_t pin, bool enabled) {
 '@
 
 $functions = @(
-    "floatToI16Reg", "clampFloat", "setHeaterContactor", "stopHeater",
+    "accountRuntime", "floatToI16Reg", "clampFloat", "setHeaterContactor", "stopHeater",
     "setHeatingEnabled", "setTargetTemperature", "contactorLockSeconds", "updateThermostat"
 )
 foreach ($name in $functions) {
@@ -73,6 +75,17 @@ void startHeating() {
   assert(heaterContactorOn && relayEnabled);
 }
 int main() {
+  clockMs = 1000;
+  accountRuntime();
+  assert(totalRuntimeMs == 1000 && heaterRuntimeMs == 0);
+  setHeaterContactor(true);
+  clockMs = 2500;
+  setHeaterContactor(false);
+  assert(totalRuntimeMs == 2500 && heaterRuntimeMs == 1500);
+  runtimeTickMs = UINT32_MAX - 100;
+  clockMs = 99;
+  accountRuntime();
+  assert(totalRuntimeMs == 2700 && heaterRuntimeMs == 1500);
   resetFixture();
   setHeatingEnabled(true);
   tick(9999, 20);

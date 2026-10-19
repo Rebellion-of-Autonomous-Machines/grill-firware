@@ -69,6 +69,7 @@ EthernetClient modbusClient;
 String networkSettingsMessage;
 bool networkSettingsSaved = false;
 
+// Internal snapshot slots; wire addresses are defined by holdingIndex/readWireRegister.
 enum ModbusReg : uint16_t {
   REG_STATUS_BITS = 0,        // RO bits: 0 enabled, 1 contactor on, 3 fault, 4 sensor fault, 5 DI6 active
   REG_TEMPERATURE_X10 = 1,    // RO int16
@@ -104,8 +105,8 @@ enum ModbusCommand : uint16_t {
   CMD_HEAT_OFF = 2,
   CMD_CLEAR_FAULT = 5,
   CMD_SAVE_THERMOSTAT = 6,
-  CMD_MOTOR_OPEN = 7,
-  CMD_MOTOR_CLOSE = 8,
+  CMD_MOTOR_OPEN = 11,
+  CMD_MOTOR_CLOSE = 12,
   CMD_MOTOR_STOP_RESERVED = 9 // Retired command; must never stop the motor.
 };
 
@@ -144,6 +145,30 @@ uint32_t openRemainingMs = OPEN_TRAVEL_MS;
 uint32_t closeRunDurationMs = 0;
 bool nextMotorCommandIsOpen = true;
 bool startupOpeningInProgress = true;
+uint16_t lastMotorEvent = 0;
+uint64_t totalRuntimeMs = 0, heaterRuntimeMs = 0;
+uint32_t runtimeTickMs = 0, runtimeSaveMs = 0;
+
+void accountRuntime() {
+  uint32_t now = millis();
+  uint32_t elapsed = now - runtimeTickMs;
+  runtimeTickMs = now;
+  totalRuntimeMs += elapsed;
+  if (heaterContactorOn) heaterRuntimeMs += elapsed;
+}
+
+void maintainRuntime() {
+  accountRuntime();
+  uint32_t now = millis();
+  if (now - runtimeSaveMs < 60000) return;
+  Preferences storage;
+  if (storage.begin("runtime", false)) {
+    uint64_t counters[] = {totalRuntimeMs, heaterRuntimeMs};
+    storage.putBytes("counters", counters, sizeof(counters));
+    storage.end();
+    runtimeSaveMs = now;
+  }
+}
 float targetTemperatureC = ThermostatDefaults::targetC;
 float thermostatHysteresisC = ThermostatDefaults::hysteresisC;
 uint16_t thermostatMinOnSeconds = ThermostatDefaults::minOnSeconds;
@@ -362,6 +387,7 @@ void setHeaterContactor(bool enabled) {
   if (heaterContactorOn == enabled) {
     return;
   }
+  accountRuntime();
   heaterContactorOn = enabled;
   contactorLastChangeMs = millis();
   setRelayPin(HEATER_CONTACTOR_RELAY_PIN, enabled);
@@ -420,6 +446,7 @@ void processDI6Emergency() {
   // React once per DI6 activation. A forced restart also gives a full
   // opening interval if the emergency input appears while already opening.
   if (!di6WasActive && !startupOpeningInProgress) {
+    lastMotorEvent = 1;
     startOpenMotor(true);
   }
   di6WasActive = true;
@@ -447,6 +474,9 @@ void startCloseMotor() {
 
   stopMotor();
   delay(RELAY_DEADTIME_MS);
+  updateDI6State();
+  processDI6Emergency();
+  if (di6Active) return;
 
   nextMotorCommandIsOpen = true;
   closeRunDurationMs = closingTimeMsForHeight(closingHeightMm);
@@ -737,18 +767,19 @@ void executeModbusCommand(uint16_t cmd) {
       saveThermostatSettings();
       break;
     case CMD_MOTOR_OPEN:
-      if (!di6Active && !nextMotorCommandIsOpen) {
+      if (startupOpeningInProgress || currentDirection != MOTOR_STOP || !nextMotorCommandIsOpen) {
         commandResult = CMD_RES_BUSY;
         break;
       }
       startOpenMotor(di6Active);
       break;
     case CMD_MOTOR_CLOSE:
-      if (di6Active || nextMotorCommandIsOpen) {
+      if (startupOpeningInProgress || currentDirection != MOTOR_STOP || di6Active || nextMotorCommandIsOpen) {
         commandResult = CMD_RES_BUSY;
         break;
       }
       startCloseMotor();
+      if (di6Active) commandResult = CMD_RES_BUSY;
       break;
     case CMD_MOTOR_STOP_RESERVED:
       commandResult = CMD_RES_UNKNOWN_CMD;
@@ -826,14 +857,91 @@ void sendModbusTcpResponse(EthernetClient& client, const uint8_t* requestHeader,
   client.write(pdu, pduLen);
 }
 
+// Wire addresses are independent of the internal status snapshot indices.
+int holdingIndex(uint16_t address) {
+  static const int indices[] = {-1, REG_FAULT_CODE, -1, -1, -1, -1, -1,
+    REG_TARGET_X10, REG_CLOSING_HEIGHT_MM, REG_HEATING_ENABLE,
+    REG_HYSTERESIS_X10, REG_MIN_ON_SECONDS, REG_MIN_OFF_SECONDS,
+    REG_EMERGENCY_X10, REG_ANTICIPATION_ENABLE, REG_COMMAND,
+    REG_COMMAND_RESULT, -1};
+  return address < 18 ? indices[address] : -1;
+}
+
+uint16_t scenarioState() {
+  if (currentDirection == MOTOR_OPEN) return 11;
+  if (currentDirection == MOTOR_CLOSE) return 12;
+  if (sensorFault || faultActive) return 99;
+  return nextMotorCommandIsOpen ? 19 : 1;
+}
+
+uint8_t readWireRegister(bool input, uint16_t address, uint16_t& value) {
+  if (!input) {
+    if (address >= 2 && address <= 6) return 3;
+    if (address == 0) { value = scenarioState(); return 0; }
+    if (address == 17) { value = 2; return 0; }
+    int index = holdingIndex(address);
+    if (index < 0) return 2;
+    value = modbusRegs[index];
+    return 0;
+  }
+  if (address < 4) {
+    uint64_t seconds = (address < 2 ? totalRuntimeMs : heaterRuntimeMs) / 1000;
+    uint32_t bounded = seconds > UINT32_MAX ? UINT32_MAX : uint32_t(seconds);
+    value = (address % 2 == 0) ? (bounded >> 16) : (bounded & 0xffff);
+  } else if (address == 20) value = di6Active;
+  else if (address >= 50 && address <= 55) value = !(relayOutputMask & (1U << (address - 50)));
+  else if (address == 70) value = modbusRegs[REG_TEMPERATURE_X10];
+  else if (address == 71) value = modbusRegs[REG_SENSOR_MV];
+  else if (address == 72) value = sensorFault;
+  else if (address >= 80 && address <= 104) value = modbusRegs[address - 80];
+  else if (address == 105) value = lastMotorEvent;
+  else if (address == 106) value = (~relayOutputMask) & 0x3f;
+  else if (address == 107) value = scenarioState();
+  else return 2;
+  return 0;
+}
+
+uint8_t validateWireWrite(uint16_t address, uint16_t value) {
+  if (address >= 2 && address <= 6) return 3;
+  if (address == 1 || address >= 16) return 2;
+  if (startupOpeningInProgress) return 6;
+  if (address == 0) {
+    if (value != CMD_MOTOR_OPEN && value != CMD_MOTOR_CLOSE) return 3;
+    if (currentDirection != MOTOR_STOP) return 6;
+    if (value == CMD_MOTOR_CLOSE && (di6Active || nextMotorCommandIsOpen)) return 6;
+    if (value == CMD_MOTOR_OPEN && !nextMotorCommandIsOpen) return 6;
+  } else if (address == 15) {
+    if (value != CMD_HEAT_ON && value != CMD_HEAT_OFF &&
+        value != CMD_CLEAR_FAULT && value != CMD_SAVE_THERMOSTAT) return 3;
+  } else if (holdingIndex(address) < 0) return 2;
+  if ((address == 9 || address == 14) && value > 1) return 3;
+  return 0;
+}
+
+bool applyWireWrite(uint16_t address, uint16_t value) {
+  if (address == 0) {
+    executeModbusCommand(value);
+    return commandResult == CMD_RES_OK;
+  }
+  return writeModbusRegister(holdingIndex(address), value);
+}
+
 void sendModbusException(EthernetClient& client, const uint8_t* header, uint8_t functionCode, uint8_t exceptionCode) {
+  if (functionCode == 0x06 || functionCode == 0x10) {
+    commandResult = exceptionCode == 6 ? CMD_RES_BUSY : CMD_RES_INVALID_ARG;
+  }
   uint8_t pdu[2] = {static_cast<uint8_t>(functionCode | 0x80), exceptionCode};
   sendModbusTcpResponse(client, header, pdu, sizeof(pdu));
 }
 
 bool waitForClientBytes(EthernetClient& client, int count, uint16_t timeoutMs = 50) {
   uint32_t started = millis();
-  while (client.connected() && client.available() < count && millis() - started < timeoutMs) delay(1);
+  while (client.connected() && client.available() < count && millis() - started < timeoutMs) {
+    updateDI6State();
+    processDI6Emergency();
+    updateMotorControl();
+    delay(1);
+  }
   return client.available() >= count;
 }
 
@@ -851,20 +959,23 @@ void processModbusTcpRequest(EthernetClient& client) {
   client.read(pdu, pduLen);
   uint8_t functionCode = pdu[0];
   if (header[6] != MODBUS_UNIT_ID && header[6] != 0) return;
+  accountRuntime();
   syncModbusRegistersFromState();
 
-  if (functionCode == 0x03) {
+  if (functionCode == 0x03 || functionCode == 0x04) {
     if (pduLen < 5) { sendModbusException(client, header, functionCode, 0x03); return; }
     uint16_t startAddress = word(pdu[1], pdu[2]);
     uint16_t quantity = word(pdu[3], pdu[4]);
-    if (quantity == 0 || quantity > 60 || startAddress + quantity > REG_REG_COUNT) {
+    if (quantity == 0 || quantity > 60 || uint32_t(startAddress) + quantity > 65536) {
       sendModbusException(client, header, functionCode, 0x02); return;
     }
     uint8_t response[125];
     response[0] = functionCode;
     response[1] = quantity * 2;
     for (uint16_t i = 0; i < quantity; i++) {
-      uint16_t registerValue = modbusRegs[startAddress + i];
+      uint16_t registerValue = 0;
+      uint8_t error = readWireRegister(functionCode == 0x04, startAddress + i, registerValue);
+      if (error) { sendModbusException(client, header, functionCode, error); return; }
       response[2 + i * 2] = highByte(registerValue);
       response[3 + i * 2] = lowByte(registerValue);
     }
@@ -876,7 +987,11 @@ void processModbusTcpRequest(EthernetClient& client) {
     if (pduLen < 5) { sendModbusException(client, header, functionCode, 0x03); return; }
     uint16_t address = word(pdu[1], pdu[2]);
     uint16_t value = word(pdu[3], pdu[4]);
-    if (!writeModbusRegister(address, value)) { sendModbusException(client, header, functionCode, 0x02); return; }
+    updateDI6State();
+    processDI6Emergency();
+    uint8_t error = validateWireWrite(address, value);
+    if (error) { sendModbusException(client, header, functionCode, error); return; }
+    if (!applyWireWrite(address, value)) { sendModbusException(client, header, functionCode, 6); return; }
     sendModbusTcpResponse(client, header, pdu, 5);
     return;
   }
@@ -886,12 +1001,19 @@ void processModbusTcpRequest(EthernetClient& client) {
     uint16_t startAddress = word(pdu[1], pdu[2]);
     uint16_t quantity = word(pdu[3], pdu[4]);
     uint8_t byteCount = pdu[5];
-    if (quantity == 0 || byteCount != quantity * 2 || startAddress + quantity > REG_REG_COUNT || pduLen < 6 + byteCount) {
+    if (quantity == 0 || byteCount != quantity * 2 || uint32_t(startAddress) + quantity > 18 || pduLen != 6 + byteCount) {
       sendModbusException(client, header, functionCode, 0x02); return;
+    }
+    updateDI6State();
+    processDI6Emergency();
+    // Validate the entire packet before any setting or actuator changes.
+    for (uint16_t i = 0; i < quantity; i++) {
+      uint8_t error = validateWireWrite(startAddress + i, word(pdu[6 + i * 2], pdu[7 + i * 2]));
+      if (error) { sendModbusException(client, header, functionCode, error); return; }
     }
     for (uint16_t i = 0; i < quantity; i++) {
       uint16_t value = word(pdu[6 + i * 2], pdu[7 + i * 2]);
-      if (!writeModbusRegister(startAddress + i, value)) { sendModbusException(client, header, functionCode, 0x02); return; }
+      if (!applyWireWrite(startAddress + i, value)) { sendModbusException(client, header, functionCode, 6); return; }
     }
     uint8_t response[5] = {functionCode, pdu[1], pdu[2], pdu[3], pdu[4]};
     sendModbusTcpResponse(client, header, response, sizeof(response));
@@ -1286,8 +1408,8 @@ String generateHTML() {
       document.getElementById('fault').textContent = data.fault ? data.fault_text : '';
       document.getElementById('heatOnButton').disabled = data.heating_enabled;
       document.getElementById('heatOffButton').disabled = !data.heating_enabled;
-      document.getElementById('motorOpenButton').disabled = data.motor_direction === 1 || (!data.di6_active && data.next_motor_command !== 1);
-      document.getElementById('motorCloseButton').disabled = data.di6_active || data.motor_direction === 2 || data.next_motor_command !== 2;
+      document.getElementById('motorOpenButton').disabled = data.motor_direction !== 0 || data.next_motor_command !== 1;
+      document.getElementById('motorCloseButton').disabled = data.di6_active || data.motor_direction !== 0 || data.next_motor_command !== 2;
     }
 
     document.querySelectorAll('form:not(#networkForm)').forEach(function (form) {
@@ -1426,25 +1548,25 @@ void handleHeatOff() {
 
 void handleMotorOpen() {
   if (rejectControlDuringStartup()) return;
-  if (!di6Active && !nextMotorCommandIsOpen) {
-    server.send(409, "text/plain; charset=UTF-8", "Сначала необходимо закрыть крышку");
+  updateDI6State();
+  processDI6Emergency();
+  executeModbusCommand(CMD_MOTOR_OPEN);
+  if (commandResult != CMD_RES_OK) {
+    server.send(409, "text/plain; charset=UTF-8", "Движение занято или нарушено чередование команд");
     return;
   }
-  startOpenMotor(di6Active);
   sendActionDone();
 }
 
 void handleMotorClose() {
   if (rejectControlDuringStartup()) return;
-  if (di6Active) {
-    server.send(409, "text/plain; charset=UTF-8", "Закрытие запрещено: сработал аварийный DI6");
+  updateDI6State();
+  processDI6Emergency();
+  executeModbusCommand(CMD_MOTOR_CLOSE);
+  if (commandResult != CMD_RES_OK) {
+    server.send(409, "text/plain; charset=UTF-8", "Закрытие запрещено: движение, DI6 или чередование команд");
     return;
   }
-  if (nextMotorCommandIsOpen) {
-    server.send(409, "text/plain; charset=UTF-8", "Сначала необходимо открыть крышку");
-    return;
-  }
-  startCloseMotor();
   sendActionDone();
 }
 
@@ -1517,6 +1639,16 @@ void handleRedirectToRoot() {
 
 void setup() {
   Serial.begin(115200);
+  Preferences storage;
+  if (storage.begin("runtime", true)) {
+    uint64_t counters[2] = {};
+    if (storage.getBytesLength("counters") == sizeof(counters)) {
+      storage.getBytes("counters", counters, sizeof(counters));
+      totalRuntimeMs = counters[0];
+      heaterRuntimeMs = counters[1];
+    }
+    storage.end();
+  }
   loadThermostatSettings();
 
   pinMode(ANALOG_A1, INPUT);
@@ -1571,6 +1703,7 @@ void setup() {
 }
 
 void loop() {
+  maintainRuntime();
   dnsServer.processNextRequest();
   updateDI6State();
   processDI6Emergency();

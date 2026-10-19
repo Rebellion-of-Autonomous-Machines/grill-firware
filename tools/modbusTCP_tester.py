@@ -35,13 +35,19 @@ REG_CLOSING_HEIGHT_MM = 22
 REG_CLOSING_TIME_X10 = 23
 REG_NEXT_MOTOR_COMMAND = 24
 REGISTER_COUNT = 25
+# Snapshot offsets above are local indices, not Holding Register addresses.
+HOLDING_ADDRESS = {
+    REG_TARGET_X10: 7, REG_CLOSING_HEIGHT_MM: 8, REG_HEATING_ENABLE: 9,
+    REG_HYSTERESIS_X10: 10, REG_MIN_ON_SECONDS: 11, REG_MIN_OFF_SECONDS: 12,
+    REG_EMERGENCY_X10: 13, REG_ANTICIPATION_ENABLE: 14, REG_COMMAND: 15,
+}
 
 CMD_HEAT_ON = 1
 CMD_HEAT_OFF = 2
 CMD_CLEAR_FAULT = 5
 CMD_SAVE_THERMOSTAT = 6
-CMD_MOTOR_OPEN = 7
-CMD_MOTOR_CLOSE = 8
+CMD_MOTOR_OPEN = 11
+CMD_MOTOR_CLOSE = 12
 NOISE_FILTER_ALPHA = 0.12
 HISTORY_SECONDS = 3600
 MAX_SAMPLE_GAP_SECONDS = 3.0
@@ -199,7 +205,7 @@ class App:
             ctrl, text="Упреждение и автоподстройка",
             variable=self.anticipation_var, command=self.write_anticipation,
         )
-        self.anticipation_check.grid(row=2, column=4, columnspan=2, sticky="w")
+        self.anticipation_check.grid(row=4, column=2, columnspan=4, sticky="w")
 
         self.heat_on_button = ttk.Button(ctrl, text="Нагрев ВКЛ", command=lambda: self.set_heating(True))
         self.heat_on_button.grid(row=3, column=0, pady=4)
@@ -348,7 +354,8 @@ class App:
             raise ValueError("Ручная остановка привода запрещена")
         if not self.connected or not self.client:
             raise RuntimeError("Нет подключения")
-        rr = self._call_with_slave(self.client.write_register, addr, int(value) & 0xFFFF)
+        wire_address = 0 if addr == REG_COMMAND and value in (CMD_MOTOR_OPEN, CMD_MOTOR_CLOSE) else HOLDING_ADDRESS[addr]
+        rr = self._call_with_slave(self.client.write_register, wire_address, int(value) & 0xFFFF)
         if rr.isError():
             raise RuntimeError(str(rr))
 
@@ -435,7 +442,7 @@ class App:
             ("RELAY_ON", bool(status & (1 << 1))),
             ("FAULT", bool(status & (1 << 3))),
             ("SENSOR_FAULT", bool(status & (1 << 4))),
-            ("DI6_CLOSED", bool(status & (1 << 5))),
+            ("DI6_EMERGENCY", bool(status & (1 << 5))),
         ]
         return ", ".join(f"{name}={'1' if val else '0'}" for name, val in flags)
 
@@ -574,12 +581,21 @@ class App:
     def poll(self, record=True):
         if not self.connected or not self.client:
             return
-        rr = self._call_with_slave(self.client.read_holding_registers, 0, count=REGISTER_COUNT)
+        version = self._call_with_slave(self.client.read_holding_registers, 17, count=1)
+        if version is None or version.isError() or version.registers != [2]:
+            raise RuntimeError("Нужна прошивка modbusTCP с картой версии 2")
+        rr = self._call_with_slave(self.client.read_input_registers, 80, count=28)
         if rr is None or rr.isError():
             raise RuntimeError(f"Ошибка чтения Modbus: {rr}")
         r = rr.registers
-        if len(r) < REGISTER_COUNT:
-            raise RuntimeError("Нужны регистры 0...24. Обновите прошивку контроллера")
+        if len(r) < 28:
+            raise RuntimeError("Нужны Input Registers 30081...30108. Обновите прошивку контроллера")
+        counters = self._call_with_slave(self.client.read_input_registers, 0, count=4)
+        if counters is None or counters.isError() or len(counters.registers) != 4:
+            raise RuntimeError("Ошибка чтения наработки")
+        c = counters.registers
+        total_hours = ((c[0] << 16) | c[1]) / 3600
+        heater_hours = ((c[2] << 16) | c[3]) / 3600
 
         status = r[REG_STATUS_BITS]
         temp_raw = r[REG_TEMPERATURE_X10]
@@ -625,6 +641,7 @@ class App:
             f"Высота закрытия: {closing_height} мм   Время закрытия: {closing_time:.2f} с",
             f"Мотор: {MOTOR_DIRECTION_TEXT.get(motor_direction, str(motor_direction))}, открытие осталось {motor_open_remaining} с",
             f"DI6 аварийный концевик: {'СРАБОТАЛ' if di6_active else 'норма'}",
+            f"Наработка: {total_hours:.2f} ч; ТЭН: {heater_hours:.2f} ч; состояние: {r[27]}; выходы: 0x{r[26]:02X}; событие: {r[25]}",
             f"Следующая команда: {'Открыть' if next_motor_command == 1 else 'Закрыть' if next_motor_command == 2 else 'неизвестно'}",
             f"StatusBits=0x{status:04X} [{self._decode_status_bits(status)}]",
             f"CmdResult={cmd_res} ({CMD_RESULT_TEXT.get(cmd_res, 'Неизвестный результат')})   "
@@ -656,10 +673,10 @@ class App:
             "closing_height": str(closing_height),
         })
         self.motor_open_button.state(
-            ["disabled"] if motor_direction == 1 or (not di6_active and next_motor_command != 1) else ["!disabled"]
+            ["disabled"] if motor_direction != 0 or next_motor_command != 1 else ["!disabled"]
         )
         self.motor_close_button.state(
-            ["disabled"] if di6_active or motor_direction == 2 or next_motor_command != 2 else ["!disabled"]
+            ["disabled"] if di6_active or motor_direction != 0 or next_motor_command != 2 else ["!disabled"]
         )
         self.heat_on_button.state(["disabled"] if heating_enabled else ["!disabled"])
         self.heat_off_button.state(["disabled"] if not heating_enabled else ["!disabled"])

@@ -27,6 +27,7 @@ MotorDirection currentDirection = MOTOR_STOP;
 uint32_t motorRunStartMs = 0, openRemainingMs = OPEN_TRAVEL_MS, clockMs = 1000;
 uint32_t closeRunDurationMs = 0;
 uint16_t closingHeightMm = 60;
+uint16_t lastMotorEvent = 0;
 bool nextMotorCommandIsOpen = true;
 bool startupOpeningInProgress = false;
 bool di6Active = false, di6WasActive = false, relayA = false, relayB = false;
@@ -42,6 +43,9 @@ void setMotorRelaysRaw(bool a, bool b) {
 void setHeatingEnabled(bool on) { heatingEnabled = on; }
 void saveThermostatSettings() {}
 void syncModbusRegistersFromState() {}
+void updateDI6State() {}
+bool rejectControlDuringStartup() { return startupOpeningInProgress; }
+void sendActionDone() {}
 uint32_t closingTimeMsForHeight(uint16_t) { return 1300; }
 struct Server {
   int code = 0;
@@ -53,7 +57,8 @@ foreach ($name in @(
     "stopMotorRaw", "accountOpenElapsed", "stopMotor", "startOpenMotor",
     "processDI6Emergency",
     "startCloseMotor", "completeOpenMotor", "completeCloseMotor",
-    "updateMotorControl", "executeModbusCommand", "handleMotorStopDisabled"
+    "updateMotorControl", "executeModbusCommand", "handleMotorStopDisabled",
+    "handleMotorOpen", "handleMotorClose"
 )) {
     $fixture += [Environment]::NewLine + (Extract ("(?ms)^void " + $name + "\([^;{]*\) \{.*?^\}"))
 }
@@ -79,6 +84,10 @@ int main() {
   executeModbusCommand(CMD_MOTOR_OPEN);
   assert(commandResult == CMD_RES_OK && currentDirection == MOTOR_OPEN);
   assert(relayA && !relayB);
+  executeModbusCommand(CMD_MOTOR_CLOSE);
+  assert(commandResult == CMD_RES_BUSY && currentDirection == MOTOR_OPEN);
+  handleMotorClose();
+  assert(server.code == 409 && currentDirection == MOTOR_OPEN);
   clockMs += 5000;
   assertManualStopRejected();
   clockMs = motorRunStartMs + OPEN_TRAVEL_MS - 1;
@@ -95,6 +104,21 @@ int main() {
   executeModbusCommand(CMD_MOTOR_CLOSE);
   assert(commandResult == CMD_RES_OK && currentDirection == MOTOR_CLOSE);
   assert(!relayA && relayB);
+  executeModbusCommand(CMD_MOTOR_OPEN);
+  assert(commandResult == CMD_RES_BUSY && currentDirection == MOTOR_CLOSE);
+  handleMotorOpen();
+  assert(server.code == 409 && currentDirection == MOTOR_CLOSE);
+  // DI6 must bypass both interface locks while keeping heating enabled.
+  heatingEnabled = true;
+  di6Active = true;
+  processDI6Emergency();
+  assert(currentDirection == MOTOR_OPEN && heatingEnabled && lastMotorEvent == 1);
+  clockMs = motorRunStartMs + OPEN_TRAVEL_MS;
+  updateMotorControl();
+  di6Active = false;
+  processDI6Emergency();
+  handleMotorClose();
+  assert(commandResult == CMD_RES_OK && currentDirection == MOTOR_CLOSE);
   clockMs = motorRunStartMs + closeRunDurationMs - 1;
   assertManualStopRejected();
   updateMotorControl();
@@ -121,9 +145,7 @@ int main() {
   executeModbusCommand(CMD_MOTOR_CLOSE);
   assert(commandResult == CMD_RES_BUSY && currentDirection == MOTOR_STOP);
   executeModbusCommand(CMD_MOTOR_OPEN);
-  assert(commandResult == CMD_RES_OK && currentDirection == MOTOR_OPEN);
-  clockMs = motorRunStartMs + OPEN_TRAVEL_MS;
-  updateMotorControl();
+  assert(commandResult == CMD_RES_BUSY && currentDirection == MOTOR_STOP);
   di6Active = false;
   processDI6Emergency();
   executeModbusCommand(CMD_MOTOR_CLOSE);
