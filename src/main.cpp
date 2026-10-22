@@ -878,15 +878,15 @@ uint8_t readWireRegister(bool input, uint16_t address, uint16_t& value) {
   if (!input) {
     if (address >= 2 && address <= 6) return 3;
     if (address == 0) { value = scenarioState(); return 0; }
-    if (address == 17) { value = 2; return 0; }
+    if (address == 17) { value = 3; return 0; }
     int index = holdingIndex(address);
     if (index < 0) return 2;
     value = modbusRegs[index];
     return 0;
   }
   if (address < 4) {
-    uint64_t seconds = (address < 2 ? totalRuntimeMs : heaterRuntimeMs) / 1000;
-    uint32_t bounded = seconds > UINT32_MAX ? UINT32_MAX : uint32_t(seconds);
+    uint64_t hours = (address < 2 ? totalRuntimeMs : heaterRuntimeMs) / 3600000ULL;
+    uint32_t bounded = hours > UINT32_MAX ? UINT32_MAX : uint32_t(hours);
     value = (address % 2 == 0) ? (bounded >> 16) : (bounded & 0xffff);
   } else if (address == 20) value = di6Active;
   else if (address >= 50 && address <= 55) value = !(relayOutputMask & (1U << (address - 50)));

@@ -582,8 +582,8 @@ class App:
         if not self.connected or not self.client:
             return
         version = self._call_with_slave(self.client.read_holding_registers, 17, count=1)
-        if version is None or version.isError() or version.registers != [2]:
-            raise RuntimeError("Нужна прошивка modbusTCP с картой версии 2")
+        if version is None or version.isError() or version.registers != [3]:
+            raise RuntimeError("Нужна прошивка modbusTCP с картой версии 3")
         rr = self._call_with_slave(self.client.read_input_registers, 80, count=28)
         if rr is None or rr.isError():
             raise RuntimeError(f"Ошибка чтения Modbus: {rr}")
@@ -594,8 +594,8 @@ class App:
         if counters is None or counters.isError() or len(counters.registers) != 4:
             raise RuntimeError("Ошибка чтения наработки")
         c = counters.registers
-        total_hours = ((c[0] << 16) | c[1]) / 3600
-        heater_hours = ((c[2] << 16) | c[3]) / 3600
+        total_hours = (c[0] << 16) | c[1]
+        heater_hours = (c[2] << 16) | c[3]
 
         status = r[REG_STATUS_BITS]
         temp_raw = r[REG_TEMPERATURE_X10]
@@ -641,7 +641,7 @@ class App:
             f"Высота закрытия: {closing_height} мм   Время закрытия: {closing_time:.2f} с",
             f"Мотор: {MOTOR_DIRECTION_TEXT.get(motor_direction, str(motor_direction))}, открытие осталось {motor_open_remaining} с",
             f"DI6 аварийный концевик: {'СРАБОТАЛ' if di6_active else 'норма'}",
-            f"Наработка: {total_hours:.2f} ч; ТЭН: {heater_hours:.2f} ч; состояние: {r[27]}; выходы: 0x{r[26]:02X}; событие: {r[25]}",
+            f"Наработка: {total_hours} ч; ТЭН: {heater_hours} ч; состояние: {r[27]}; выходы: 0x{r[26]:02X}; событие: {r[25]}",
             f"Следующая команда: {'Открыть' if next_motor_command == 1 else 'Закрыть' if next_motor_command == 2 else 'неизвестно'}",
             f"StatusBits=0x{status:04X} [{self._decode_status_bits(status)}]",
             f"CmdResult={cmd_res} ({CMD_RESULT_TEXT.get(cmd_res, 'Неизвестный результат')})   "

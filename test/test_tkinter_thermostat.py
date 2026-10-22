@@ -39,14 +39,14 @@ class FakeClient:
         if self.fail_read:
             raise TimeoutError("test timeout")
         assert (address, count) == (17, 1)
-        return Response([2])
+        return Response([3])
 
     def read_input_registers(self, address, *, count=1, device_id=1):
         self.reads.append((address, count, device_id))
         if self.fail_read:
             raise TimeoutError("test timeout")
         if address == 0:
-            return Response([0, 7200, 0, 3600])
+            return Response([0, 2, 0, 1])
         assert (address, count) == (80, 28)
         return Response(self.registers[:count])
 
@@ -83,6 +83,7 @@ class AppTest(unittest.TestCase):
 
     def test_register_decoding_and_status(self):
         self.app.poll()
+        self.assertIn("Наработка: 2 ч; ТЭН: 1 ч", self.app.values_var.get())
         self.assertEqual(self.client.reads, [(17, 1, 1), (80, 28, 1), (0, 4, 1)])
         self.assertEqual(len(self.app.history), 1)
         sample = self.app.history[-1]
@@ -171,8 +172,8 @@ class AppTest(unittest.TestCase):
         self.assertEqual(self.client.writes, [(0, 12, 1), (0, 11, 1), (9, 1, 1), (15, 5, 1)])
 
     def test_old_protocol_version_is_rejected(self):
-        with patch.object(self.client, "read_holding_registers", return_value=Response([1])):
-            with self.assertRaisesRegex(RuntimeError, "версии 2"):
+        with patch.object(self.client, "read_holding_registers", return_value=Response([2])):
+            with self.assertRaisesRegex(RuntimeError, "версии 3"):
                 self.app.poll()
         self.assertFalse(self.client.writes)
 
