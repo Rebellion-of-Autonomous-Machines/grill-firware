@@ -7,6 +7,7 @@
 #include <Preferences.h>
 #include <math.h>
 #include "ThermostatAnticipation.h"
+#include "EnergySavingControl.h"
 
 // --- Analog thermocouple amplifier AD8495 ---
 static const uint8_t ANALOG_A1 = 36;
@@ -114,7 +115,8 @@ enum ModbusCommandResult : uint16_t {
   CMD_RES_OK = 0,
   CMD_RES_UNKNOWN_CMD = 1,
   CMD_RES_BUSY = 2,
-  CMD_RES_INVALID_ARG = 3
+  CMD_RES_INVALID_ARG = 3,
+  CMD_RES_TEMPERATURE_NOT_READY = 4
 };
 
 uint16_t modbusRegs[REG_REG_COUNT] = {0};
@@ -175,6 +177,7 @@ uint16_t thermostatMinOnSeconds = ThermostatDefaults::minOnSeconds;
 uint16_t thermostatMinOffSeconds = ThermostatDefaults::minOffSeconds;
 bool anticipationEnabled = true;
 ThermostatAnticipation anticipation;
+EnergySavingControl energySaving;
 float emergencyTemperatureC = 300.0f;
 uint16_t closingHeightMm = DEFAULT_CLOSING_HEIGHT_MM;
 uint32_t contactorLastChangeMs = 0;
@@ -194,6 +197,30 @@ void saveThermostatSettings();
 float clampFloat(float value, float low, float high);
 void syncModbusRegistersFromState();
 void handleModbusTcp();
+void updateEnergySaving();
+
+float effectiveTargetTemperature() {
+  return energySaving.eco() ? EnergySavingControl::standbyC : targetTemperatureC;
+}
+
+void updateEnergySaving() {
+  bool previousEco = energySaving.eco();
+  bool healthy = !sensorFault && !faultActive &&
+      isfinite(lastTemperatureC) && isfinite(lastRawTemperatureC) &&
+      millis() - lastSensorReadMs <= 3000UL &&
+      lastTemperatureC < emergencyTemperatureC && lastRawTemperatureC < emergencyTemperatureC;
+  energySaving.update(heatingEnabled, targetTemperatureC, lastTemperatureC,
+                      healthy, currentDirection != MOTOR_STOP, millis());
+  if (previousEco != energySaving.eco()) anticipation.reset();
+}
+
+bool prepareLidCommand() {
+  updateEnergySaving();
+  bool wasEco = energySaving.eco();
+  bool allowed = energySaving.lidCommand(millis());
+  if (wasEco) anticipation.reset();
+  return allowed;
+}
 
 uint16_t floatToU16(float value, float scale) {
   int32_t scaled = static_cast<int32_t>(lroundf(value * scale));
@@ -556,6 +583,7 @@ void stopHeater(const String& reason) {
 void setHeatingEnabled(bool enabled) {
   if (heatingEnabled != enabled) anticipation.reset();
   heatingEnabled = enabled;
+  updateEnergySaving();
   modbusRegs[REG_HEATING_ENABLE] = heatingEnabled ? 1 : 0;
 
   if (!heatingEnabled) {
@@ -566,6 +594,7 @@ void setHeatingEnabled(bool enabled) {
 void setTargetTemperature(float targetC) {
   if (fabsf(targetC - targetTemperatureC) > 0.01f) anticipation.reset();
   targetTemperatureC = clampFloat(targetC, MIN_TARGET_C, MAX_TARGET_C);
+  updateEnergySaving();
   modbusRegs[REG_TARGET_X10] = floatToI16Reg(targetTemperatureC, 10.0f);
 }
 
@@ -597,6 +626,7 @@ uint16_t contactorLockSeconds(uint32_t nowMs) {
 }
 
 void updateThermostat(uint32_t nowMs) {
+  updateEnergySaving();
   if (!heatingEnabled || faultActive || sensorFault ||
       !isfinite(lastTemperatureC) || !isfinite(lastRawTemperatureC) ||
       nowMs - lastSensorReadMs > 3000UL) {
@@ -618,10 +648,10 @@ void updateThermostat(uint32_t nowMs) {
   bool requestedOn = heaterContactorOn;
   if (anticipationEnabled) {
     requestedOn = anticipation.demand(heaterContactorOn, lastTemperatureC,
-                                      targetTemperatureC, thermostatHysteresisC);
-  } else if (heaterContactorOn && lastTemperatureC >= targetTemperatureC) {
+                                      effectiveTargetTemperature(), thermostatHysteresisC);
+  } else if (heaterContactorOn && lastTemperatureC >= effectiveTargetTemperature()) {
     requestedOn = false;
-  } else if (!heaterContactorOn && lastTemperatureC <= targetTemperatureC - thermostatHysteresisC) {
+  } else if (!heaterContactorOn && lastTemperatureC <= effectiveTargetTemperature() - thermostatHysteresisC) {
     requestedOn = true;
   }
   if (requestedOn != heaterContactorOn) {
@@ -651,12 +681,12 @@ String boolToJson(bool value) {
 }
 
 float thermostatOnThreshold() {
-  return anticipationEnabled ? anticipation.onThreshold(targetTemperatureC, thermostatHysteresisC)
-                             : targetTemperatureC - thermostatHysteresisC;
+  return anticipationEnabled ? anticipation.onThreshold(effectiveTargetTemperature(), thermostatHysteresisC)
+                             : effectiveTargetTemperature() - thermostatHysteresisC;
 }
 
 float thermostatOffThreshold() {
-  return anticipationEnabled ? anticipation.offThreshold(targetTemperatureC) : targetTemperatureC;
+  return anticipationEnabled ? anticipation.offThreshold(effectiveTargetTemperature()) : effectiveTargetTemperature();
 }
 
 String statusJson() {
@@ -666,6 +696,9 @@ String statusJson() {
   json += ",\"ad8495_mv\":";
   json += isnan(ad8495VoltageMv) ? "null" : String(ad8495VoltageMv, 1);
   json += ",\"target\":" + String(targetTemperatureC, 1);
+  json += ",\"effective_target\":" + String(effectiveTargetTemperature(), 1);
+  json += ",\"energy_saving\":" + boolToJson(energySaving.eco());
+  json += ",\"temperature_ready\":" + boolToJson(energySaving.ready());
   json += ",\"hysteresis\":" + String(thermostatHysteresisC, 1);
   json += ",\"anticipation_enabled\":" + boolToJson(anticipationEnabled);
   json += ",\"temperature_rate\":" + String(anticipation.rateCPerSecond() * 60.0f, 2);
@@ -696,6 +729,8 @@ String statusJson() {
 
 void syncModbusRegistersFromState() {
   uint16_t statusBits = 0;
+  if (energySaving.eco()) statusBits |= (1U << 6);
+  if (energySaving.ready()) statusBits |= (1U << 7);
   if (heatingEnabled) {
     statusBits |= (1U << 0);
   }
@@ -748,6 +783,11 @@ void syncModbusRegistersFromState() {
 
 void executeModbusCommand(uint16_t cmd) {
   commandResult = CMD_RES_OK;
+  if ((cmd == CMD_MOTOR_OPEN || cmd == CMD_MOTOR_CLOSE) && !prepareLidCommand()) {
+    commandResult = CMD_RES_TEMPERATURE_NOT_READY;
+    syncModbusRegistersFromState();
+    return;
+  }
   switch (cmd) {
     case CMD_NONE:
       break;
@@ -878,7 +918,7 @@ uint8_t readWireRegister(bool input, uint16_t address, uint16_t& value) {
   if (!input) {
     if (address >= 2 && address <= 6) return 3;
     if (address == 0) { value = scenarioState(); return 0; }
-    if (address == 17) { value = 3; return 0; }
+    if (address == 17) { value = 4; return 0; }
     int index = holdingIndex(address);
     if (index < 0) return 2;
     value = modbusRegs[index];
@@ -897,6 +937,8 @@ uint8_t readWireRegister(bool input, uint16_t address, uint16_t& value) {
   else if (address == 105) value = lastMotorEvent;
   else if (address == 106) value = (~relayOutputMask) & 0x3f;
   else if (address == 107) value = scenarioState();
+  else if (address == 108) value = floatToI16Reg(effectiveTargetTemperature(), 10.0f);
+  else if (address == 109) value = energySaving.idleSecondsLeft(millis());
   else return 2;
   return 0;
 }
@@ -907,9 +949,6 @@ uint8_t validateWireWrite(uint16_t address, uint16_t value) {
   if (startupOpeningInProgress) return 6;
   if (address == 0) {
     if (value != CMD_MOTOR_OPEN && value != CMD_MOTOR_CLOSE) return 3;
-    if (currentDirection != MOTOR_STOP) return 6;
-    if (value == CMD_MOTOR_CLOSE && (di6Active || nextMotorCommandIsOpen)) return 6;
-    if (value == CMD_MOTOR_OPEN && !nextMotorCommandIsOpen) return 6;
   } else if (address == 15) {
     if (value != CMD_HEAT_ON && value != CMD_HEAT_OFF &&
         value != CMD_CLEAR_FAULT && value != CMD_SAVE_THERMOSTAT) return 3;
@@ -928,7 +967,8 @@ bool applyWireWrite(uint16_t address, uint16_t value) {
 
 void sendModbusException(EthernetClient& client, const uint8_t* header, uint8_t functionCode, uint8_t exceptionCode) {
   if (functionCode == 0x06 || functionCode == 0x10) {
-    commandResult = exceptionCode == 6 ? CMD_RES_BUSY : CMD_RES_INVALID_ARG;
+    if (exceptionCode != 6 || commandResult != CMD_RES_TEMPERATURE_NOT_READY)
+      commandResult = exceptionCode == 6 ? CMD_RES_BUSY : CMD_RES_INVALID_ARG;
   }
   uint8_t pdu[2] = {static_cast<uint8_t>(functionCode | 0x80), exceptionCode};
   sendModbusTcpResponse(client, header, pdu, sizeof(pdu));
@@ -1229,6 +1269,8 @@ String generateHTML() {
       <button id="setButton" type="submit">Сохранить параметры</button>
     </form>
     <div id="actionMessage" class="fault" role="alert"></div>
+    <div id="temperatureWarning" class="fault" role="status"></div>
+    <div class="status">Действующая уставка: <b id="effectiveTarget">-</b> °C</div>
     <div class="actions">
       <form action="/heat/on" method="get">
         <button id="heatOnButton" type="submit">Включить нагрев</button>
@@ -1373,6 +1415,11 @@ String generateHTML() {
       const data = await response.json();
       document.getElementById('temperature').textContent = data.temperature === null ? 'Нет данных' : data.temperature.toFixed(2);
       document.getElementById('target').textContent = data.target.toFixed(1);
+      document.getElementById('effectiveTarget').textContent = data.effective_target.toFixed(1);
+      document.getElementById('temperatureWarning').textContent = data.energy_saving
+        ? 'Энергосбережение: 100 °C. Команда крышки восстановит рабочую уставку. После прогрева повторите команду.'
+        : (data.heating_enabled && !data.temperature_ready
+          ? 'Рабочая температура не достигнута. Работа крышки заблокирована до прогрева.' : '');
       const fields = {
         targetInput: data.target.toFixed(1),
         hysteresisInput: data.hysteresis.toFixed(1),
@@ -1408,8 +1455,9 @@ String generateHTML() {
       document.getElementById('fault').textContent = data.fault ? data.fault_text : '';
       document.getElementById('heatOnButton').disabled = data.heating_enabled;
       document.getElementById('heatOffButton').disabled = !data.heating_enabled;
-      document.getElementById('motorOpenButton').disabled = data.motor_direction !== 0 || data.next_motor_command !== 1;
-      document.getElementById('motorCloseButton').disabled = data.di6_active || data.motor_direction !== 0 || data.next_motor_command !== 2;
+      const warming = data.heating_enabled && !data.temperature_ready && !data.energy_saving;
+      document.getElementById('motorOpenButton').disabled = warming || data.motor_direction !== 0 || data.next_motor_command !== 1;
+      document.getElementById('motorCloseButton').disabled = warming || data.di6_active || data.motor_direction !== 0 || data.next_motor_command !== 2;
     }
 
     document.querySelectorAll('form:not(#networkForm)').forEach(function (form) {
@@ -1551,6 +1599,10 @@ void handleMotorOpen() {
   updateDI6State();
   processDI6Emergency();
   executeModbusCommand(CMD_MOTOR_OPEN);
+  if (commandResult == CMD_RES_TEMPERATURE_NOT_READY) {
+    server.send(409, "text/plain; charset=UTF-8", "Рабочая температура не достигнута. Дождитесь прогрева и повторите команду.");
+    return;
+  }
   if (commandResult != CMD_RES_OK) {
     server.send(409, "text/plain; charset=UTF-8", "Движение занято или нарушено чередование команд");
     return;
@@ -1563,6 +1615,10 @@ void handleMotorClose() {
   updateDI6State();
   processDI6Emergency();
   executeModbusCommand(CMD_MOTOR_CLOSE);
+  if (commandResult == CMD_RES_TEMPERATURE_NOT_READY) {
+    server.send(409, "text/plain; charset=UTF-8", "Рабочая температура не достигнута. Дождитесь прогрева и повторите команду.");
+    return;
+  }
   if (commandResult != CMD_RES_OK) {
     server.send(409, "text/plain; charset=UTF-8", "Закрытие запрещено: движение, DI6 или чередование команд");
     return;
@@ -1704,6 +1760,7 @@ void setup() {
 
 void loop() {
   maintainRuntime();
+  updateEnergySaving();
   dnsServer.processNextRequest();
   updateDI6State();
   processDI6Emergency();

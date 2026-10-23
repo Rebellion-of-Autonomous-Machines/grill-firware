@@ -64,6 +64,7 @@ CMD_RESULT_TEXT = {
     1: "Неизвестная команда",
     2: "Занят",
     3: "Некорректный параметр",
+    4: "Рабочая температура не достигнута: дождитесь прогрева и повторите команду",
 }
 
 FAULT_TEXT = {
@@ -357,6 +358,10 @@ class App:
         wire_address = 0 if addr == REG_COMMAND and value in (CMD_MOTOR_OPEN, CMD_MOTOR_CLOSE) else HOLDING_ADDRESS[addr]
         rr = self._call_with_slave(self.client.write_register, wire_address, int(value) & 0xFFFF)
         if rr.isError():
+            if addr == REG_COMMAND and value in (CMD_MOTOR_OPEN, CMD_MOTOR_CLOSE):
+                result = self._call_with_slave(self.client.read_holding_registers, 16, count=1)
+                if result is not None and not result.isError() and result.registers == [4]:
+                    raise RuntimeError(CMD_RESULT_TEXT[4])
             raise RuntimeError(str(rr))
 
     def send_command(self, cmd: int):
@@ -364,6 +369,11 @@ class App:
             self.write_reg(REG_COMMAND, cmd)
             self.poll(record=False)
         except Exception as exc:
+            if self.connected:
+                try:
+                    self.poll(record=False)
+                except Exception:
+                    pass
             messagebox.showerror("Modbus", str(exc))
 
     def set_heating(self, enabled: bool):
@@ -443,6 +453,8 @@ class App:
             ("FAULT", bool(status & (1 << 3))),
             ("SENSOR_FAULT", bool(status & (1 << 4))),
             ("DI6_EMERGENCY", bool(status & (1 << 5))),
+            ("ENERGY_SAVING", bool(status & (1 << 6))),
+            ("TEMPERATURE_READY", bool(status & (1 << 7))),
         ]
         return ", ".join(f"{name}={'1' if val else '0'}" for name, val in flags)
 
@@ -582,14 +594,14 @@ class App:
         if not self.connected or not self.client:
             return
         version = self._call_with_slave(self.client.read_holding_registers, 17, count=1)
-        if version is None or version.isError() or version.registers != [3]:
-            raise RuntimeError("Нужна прошивка modbusTCP с картой версии 3")
-        rr = self._call_with_slave(self.client.read_input_registers, 80, count=28)
+        if version is None or version.isError() or version.registers != [4]:
+            raise RuntimeError("Нужна прошивка modbusTCP с картой версии 4")
+        rr = self._call_with_slave(self.client.read_input_registers, 80, count=30)
         if rr is None or rr.isError():
             raise RuntimeError(f"Ошибка чтения Modbus: {rr}")
         r = rr.registers
-        if len(r) < 28:
-            raise RuntimeError("Нужны Input Registers 30081...30108. Обновите прошивку контроллера")
+        if len(r) < 30:
+            raise RuntimeError("Нужны Input Registers 30081...30110. Обновите прошивку контроллера")
         counters = self._call_with_slave(self.client.read_input_registers, 0, count=4)
         if counters is None or counters.isError() or len(counters.registers) != 4:
             raise RuntimeError("Ошибка чтения наработки")
@@ -611,6 +623,9 @@ class App:
         motor_direction = r[REG_MOTOR_DIRECTION]
         motor_open_remaining = r[REG_MOTOR_OPEN_REMAINING_SEC]
         heating_enabled = bool(status & (1 << 0))
+        eco = bool(status & (1 << 6))
+        ready = bool(status & (1 << 7))
+        effective_target = self._to_i16(r[28]) / 10.0
         heater_relay_on = bool(status & (1 << 1))
         di6_active = bool(status & (1 << 5))
         anticipation_enabled = bool(r[REG_ANTICIPATION_ENABLE])
@@ -628,7 +643,11 @@ class App:
         self.anticipation_var.set(anticipation_enabled)
         self.anticipation_check.state(["!disabled"])
 
-        self.status_var.set("Подключено, данные обновлены")
+        self.status_var.set(
+            "Энергосбережение: команда крышки восстановит рабочую уставку; после прогрева повторите команду"
+            if eco else "Температура не достигла уставки: работа крышки заблокирована"
+            if heating_enabled and not ready else "Подключено, данные обновлены"
+        )
         self.contactor_var.set(
             f"Контактор: {'ВКЛ' if heater_relay_on else 'ВЫКЛ'}   |   "
             f"Нагрев: {'разрешен' if heating_enabled else 'выключен'}   |   "
@@ -636,7 +655,7 @@ class App:
         )
         self.contactor_label.configure(foreground="#a16207" if heater_relay_on else "#475569")
         lines = [
-            f"Температура: {temp_text} °C   Уставка: {target:.1f} °C   Гистерезис: {hysteresis:.1f} °C   AD8495: {r[REG_SENSOR_MV]} мВ",
+            f"Температура: {temp_text} °C   Уставка: {target:.1f} / действующая {effective_target:.1f} °C   AD8495: {r[REG_SENSOR_MV]} мВ",
             f"Мин. ON/OFF: {min_on}/{min_off} с   Авария: {emergency:.1f} °C   "
             f"Высота закрытия: {closing_height} мм   Время закрытия: {closing_time:.2f} с",
             f"Мотор: {MOTOR_DIRECTION_TEXT.get(motor_direction, str(motor_direction))}, открытие осталось {motor_open_remaining} с",
@@ -673,15 +692,15 @@ class App:
             "closing_height": str(closing_height),
         })
         self.motor_open_button.state(
-            ["disabled"] if motor_direction != 0 or next_motor_command != 1 else ["!disabled"]
+            ["disabled"] if (heating_enabled and not ready and not eco) or motor_direction != 0 or next_motor_command != 1 else ["!disabled"]
         )
         self.motor_close_button.state(
-            ["disabled"] if di6_active or motor_direction != 0 or next_motor_command != 2 else ["!disabled"]
+            ["disabled"] if (heating_enabled and not ready and not eco) or di6_active or motor_direction != 0 or next_motor_command != 2 else ["!disabled"]
         )
         self.heat_on_button.state(["disabled"] if heating_enabled else ["!disabled"])
         self.heat_off_button.state(["disabled"] if not heating_enabled else ["!disabled"])
         if record:
-            self._append_history(temperature, target, on_threshold, off_threshold, heater_relay_on)
+            self._append_history(temperature, effective_target, on_threshold, off_threshold, heater_relay_on)
         self._draw_graph()
 
     def _tick(self):

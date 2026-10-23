@@ -5,7 +5,7 @@ $source = Get-Content -Raw -Encoding UTF8 (Join-Path $root "src/main.cpp")
 
 # Compile the actual controller functions, not a second implementation.
 function Get-ControllerFunction([string]$name) {
-    $pattern = "(?ms)^(?:void|float|uint16_t) " + [regex]::Escape($name) + "\([^;{]*\) \{.*?^\}"
+    $pattern = "(?ms)^(?:void|float|uint16_t|bool) " + [regex]::Escape($name) + "\([^;{]*\) \{.*?^\}"
     $match = [regex]::Match($source, $pattern)
     if (-not $match.Success) { throw "Function not found: $name" }
     return $match.Value
@@ -13,6 +13,7 @@ function Get-ControllerFunction([string]$name) {
 
 $fixture = @'
 #include "ThermostatAnticipation.h"
+#include "EnergySavingControl.h"
 #include <assert.h>
 #include <stdio.h>
 #include <string>
@@ -32,6 +33,7 @@ uint32_t contactorLastChangeMs = 0, lastSensorReadMs = 0, clockMs = 0;
 bool relayEnabled = false;
 int relayWrites = 0;
 ThermostatAnticipation anticipation;
+EnergySavingControl energySaving;
 uint32_t millis() { return clockMs; }
 uint64_t totalRuntimeMs = 0, heaterRuntimeMs = 0;
 uint32_t runtimeTickMs = 0;
@@ -43,6 +45,7 @@ void setRelayPin(uint8_t pin, bool enabled) {
 '@
 
 $functions = @(
+    "effectiveTargetTemperature", "updateEnergySaving", "prepareLidCommand",
     "accountRuntime", "floatToI16Reg", "clampFloat", "setHeaterContactor", "stopHeater",
     "setHeatingEnabled", "setTargetTemperature", "contactorLockSeconds", "updateThermostat"
 )
@@ -52,6 +55,7 @@ foreach ($name in $functions) {
 
 $fixture += @'
 void resetFixture() {
+  energySaving = EnergySavingControl();
   anticipation.reset();
   heatingEnabled = heaterContactorOn = relayEnabled = faultActive = sensorFault = false;
   anticipationEnabled = true;
@@ -164,7 +168,30 @@ int main() {
   contactorLastChangeMs = UINT32_MAX - 5000;
   assert(contactorLockSeconds(4998) == 1);
   assert(contactorLockSeconds(4999) == 0);
-  puts("Controller safety and relay-lock tests passed");
+  resetFixture();
+  anticipationEnabled = false;
+  setTargetTemperature(180);
+  setHeatingEnabled(true);
+  tick(10000, 175);
+  assert(energySaving.ready());
+  tick(1800000, 110);
+  assert(energySaving.eco() && targetTemperatureC == 180);
+  assert(effectiveTargetTemperature() == 100 && !heaterContactorOn);
+  tick(1810000, 97);
+  assert(heaterContactorOn); // Standby still regulates at 100 C.
+  tick(1820000, 101);
+  assert(!heaterContactorOn);
+  assert(!prepareLidCommand()); // Wake is refused without queuing movement.
+  assert(!energySaving.eco() && effectiveTargetTemperature() == 180);
+  tick(1830000, 174);
+  assert(!energySaving.ready() && heaterContactorOn);
+  tick(1840000, 175);
+  assert(energySaving.ready() && prepareLidCommand());
+  tick(1850000, 170);
+  assert(energySaving.ready()); // Normal cycle does not clear readiness.
+  setHeatingEnabled(false);
+  assert(prepareLidCommand());
+  puts("Controller safety, relay locks and standby thermostat tests passed");
 }
 '@
 

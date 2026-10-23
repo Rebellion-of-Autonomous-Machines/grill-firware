@@ -21,8 +21,8 @@ class Response:
 class FakeClient:
     def __init__(self):
         self.registers = [
-            3, 994, 1000, 20, 10, 10, 3000, 0, 0, 7, 0, 1, 1287, 0, 15,
-            1, (-125) & 0xFFFF, 990, 975, 300, 150, 4, 60, 13, 2, 0, 8, 1,
+            131, 994, 1000, 20, 10, 10, 3000, 0, 0, 7, 0, 1, 1287, 0, 15,
+            1, (-125) & 0xFFFF, 990, 975, 300, 150, 4, 60, 13, 2, 0, 8, 1, 1000, 1800,
         ]
         self.writes = []
         self.reads = []
@@ -38,8 +38,10 @@ class FakeClient:
         self.reads.append((address, count, device_id))
         if self.fail_read:
             raise TimeoutError("test timeout")
+        if address == 16:
+            return Response([self.registers[8]])
         assert (address, count) == (17, 1)
-        return Response([3])
+        return Response([4])
 
     def read_input_registers(self, address, *, count=1, device_id=1):
         self.reads.append((address, count, device_id))
@@ -47,7 +49,7 @@ class FakeClient:
             raise TimeoutError("test timeout")
         if address == 0:
             return Response([0, 2, 0, 1])
-        assert (address, count) == (80, 28)
+        assert (address, count) == (80, 30)
         return Response(self.registers[:count])
 
     def write_register(self, address, value, *, device_id=1):
@@ -84,7 +86,7 @@ class AppTest(unittest.TestCase):
     def test_register_decoding_and_status(self):
         self.app.poll()
         self.assertIn("Наработка: 2 ч; ТЭН: 1 ч", self.app.values_var.get())
-        self.assertEqual(self.client.reads, [(17, 1, 1), (80, 28, 1), (0, 4, 1)])
+        self.assertEqual(self.client.reads, [(17, 1, 1), (80, 30, 1), (0, 4, 1)])
         self.assertEqual(len(self.app.history), 1)
         sample = self.app.history[-1]
         self.assertEqual(sample.temperature, 99.4)
@@ -173,7 +175,7 @@ class AppTest(unittest.TestCase):
 
     def test_old_protocol_version_is_rejected(self):
         with patch.object(self.client, "read_holding_registers", return_value=Response([2])):
-            with self.assertRaisesRegex(RuntimeError, "версии 3"):
+            with self.assertRaisesRegex(RuntimeError, "версии 4"):
                 self.app.poll()
         self.assertFalse(self.client.writes)
 
@@ -185,6 +187,38 @@ class AppTest(unittest.TestCase):
                 self.app.poll(record=False)
                 self.assertTrue(self.app.motor_open_button.instate(["disabled"]))
                 self.assertTrue(self.app.motor_close_button.instate(["disabled"]))
+
+    def test_warmup_blocks_then_ready_enables_close(self):
+        self.client.registers[0] = 1
+        self.app.poll(record=False)
+        self.assertTrue(self.app.motor_close_button.instate(["disabled"]))
+        self.assertIn("заблокирована", self.app.status_var.get())
+        self.client.registers[0] |= 1 << 7
+        self.app.poll(record=False)
+        self.assertFalse(self.app.motor_close_button.instate(["disabled"]))
+
+    def test_eco_allows_wake_and_keeps_working_target_in_field(self):
+        self.client.registers[0] = 1 | (1 << 6)
+        self.client.registers[2] = 1800
+        self.client.registers[28] = 1000
+        self.app.poll()
+        self.assertFalse(self.app.motor_close_button.instate(["disabled"]))
+        self.assertEqual(self.app.target_var.get(), "180.0")
+        self.assertEqual(self.app.history[-1].target, 100)
+        self.assertIn("Энергосбережение", self.app.status_var.get())
+
+    def test_cold_heat_off_allows_movement(self):
+        self.client.registers[0] = 0
+        self.client.registers[1] = 200
+        self.app.poll(record=False)
+        self.assertFalse(self.app.motor_close_button.instate(["disabled"]))
+
+    def test_modbus_thermal_refusal_is_decoded(self):
+        self.client.fail_write = True
+        self.client.registers[8] = 4
+        self.app.send_command(ui.CMD_MOTOR_CLOSE)
+        self.messages.assert_called_once()
+        self.assertIn("температура не достигнута", self.messages.call_args.args[1])
 
     def test_bad_values_never_write(self):
         self.app.poll()
@@ -228,7 +262,7 @@ class AppTest(unittest.TestCase):
 
     def test_bad_packet_is_reported(self):
         self.client.registers = self.client.registers[:16]
-        with self.assertRaisesRegex(RuntimeError, "30081...30108"):
+        with self.assertRaisesRegex(RuntimeError, "30081...30110"):
             self.app.poll()
 
     def test_hour_uses_elapsed_time_not_number_of_points(self):

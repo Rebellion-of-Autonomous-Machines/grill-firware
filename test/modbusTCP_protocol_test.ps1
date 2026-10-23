@@ -32,10 +32,21 @@ void accountRuntime() {}
 void syncModbusRegistersFromState() {}
 void updateDI6State() {}
 void processDI6Emergency() {}
+uint32_t millis() { return 0; }
+float effectiveTargetTemperature() { return 100; }
+uint16_t floatToI16Reg(float v, float scale) { return uint16_t(v * scale); }
+struct { uint16_t idleSecondsLeft(uint32_t) { return 1800; } } energySaving;
+bool thermalAllowed = true;
 bool writeModbusRegister(uint16_t address, uint16_t value) {
   ++applied; modbusRegs[address] = value; return true;
 }
 void executeModbusCommand(uint16_t cmd) {
+  if (!thermalAllowed) { commandResult = CMD_RES_TEMPERATURE_NOT_READY; return; }
+  if (currentDirection != MOTOR_STOP ||
+      (cmd == CMD_MOTOR_CLOSE && (di6Active || nextMotorCommandIsOpen)) ||
+      (cmd == CMD_MOTOR_OPEN && !nextMotorCommandIsOpen)) {
+    commandResult = CMD_RES_BUSY; return;
+  }
   ++applied;
   currentDirection = cmd == CMD_MOTOR_OPEN ? MOTOR_OPEN : MOTOR_CLOSE;
   commandResult = CMD_RES_OK;
@@ -83,7 +94,7 @@ int main() {
   exception(request({16, 0, 14, 0, 2, 4, 0, 0, 0, 99}), 16, 3);
   assert(applied == 0);
   auto version = request({3, 0, 17, 0, 1});
-  assert(version.tx[7] == 3 && version.tx[10] == 3);
+  assert(version.tx[7] == 3 && version.tx[10] == 4);
   auto counters = request({4, 0, 0, 0, 4});
   assert(counters.tx[7] == 4 && counters.tx[8] == 8);
   assert(word(counters.tx[11], counters.tx[12]) == 2);
@@ -97,8 +108,8 @@ int main() {
   modbusRegs[REG_TEMPERATURE_X10] = 1000;
   auto temp = request({4, 0, 70, 0, 1});
   assert(word(temp.tx[9], temp.tx[10]) == 1000);
-  auto snapshot = request({4, 0, 80, 0, 28});
-  assert(snapshot.tx[7] == 4 && snapshot.tx[8] == 56);
+  auto snapshot = request({4, 0, 80, 0, 30});
+  assert(snapshot.tx[7] == 4 && snapshot.tx[8] == 60);
   exception(request({4, 0, 19, 0, 2}), 4, 2);
   exception(request({6, 0, 17, 0, 2}), 6, 2);
   exception(request({6, 0, 9, 0, 2}), 6, 3);
@@ -107,6 +118,10 @@ int main() {
   assert(setpoint.tx[7] == 6 && modbusRegs[REG_TARGET_X10] == 1000);
   request({6, 0, 8, 0, 0});
   assert(modbusRegs[REG_CLOSING_HEIGHT_MM] == 0);
+  thermalAllowed = false;
+  exception(request({6, 0, 0, 0, 12}), 6, 6);
+  assert(commandResult == CMD_RES_TEMPERATURE_NOT_READY && currentDirection == MOTOR_STOP);
+  thermalAllowed = true;
   auto close = request({6, 0, 0, 0, 12});
   assert(close.tx[7] == 6 && currentDirection == MOTOR_CLOSE);
   exception(request({6, 0, 0, 0, 11}), 6, 6);

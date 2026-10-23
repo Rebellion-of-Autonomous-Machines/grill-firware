@@ -43,6 +43,8 @@ void setMotorRelaysRaw(bool a, bool b) {
 void setHeatingEnabled(bool on) { heatingEnabled = on; }
 void saveThermostatSettings() {}
 void syncModbusRegistersFromState() {}
+bool thermalAllowed = true;
+bool prepareLidCommand() { return thermalAllowed; }
 void updateDI6State() {}
 bool rejectControlDuringStartup() { return startupOpeningInProgress; }
 void sendActionDone() {}
@@ -80,6 +82,21 @@ void assertManualStopRejected() {
   assert(relayA == a && relayB == b);
 }
 int main() {
+  thermalAllowed = false;
+  handleMotorOpen();
+  assert(server.code == 409 && commandResult == CMD_RES_TEMPERATURE_NOT_READY);
+  assert(currentDirection == MOTOR_STOP);
+  executeModbusCommand(CMD_MOTOR_CLOSE);
+  assert(commandResult == CMD_RES_TEMPERATURE_NOT_READY && currentDirection == MOTOR_STOP);
+  di6Active = true;
+  processDI6Emergency();
+  assert(currentDirection == MOTOR_OPEN);
+  clockMs = motorRunStartMs + OPEN_TRAVEL_MS;
+  updateMotorControl();
+  di6Active = false;
+  processDI6Emergency();
+  nextMotorCommandIsOpen = true;
+  thermalAllowed = true;
   assertManualStopRejected();
   executeModbusCommand(CMD_MOTOR_OPEN);
   assert(commandResult == CMD_RES_OK && currentDirection == MOTOR_OPEN);
